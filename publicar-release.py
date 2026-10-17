@@ -368,19 +368,72 @@ def publish_github_release(token: str, version: str, exe_path: str, notes: str) 
     return html_url
 
 
-def sync_git_repository(proj_dir: str, version: str) -> None:
+def extract_or_update_changelog(proj_dir: str, version: str, custom_notes: str | None) -> str:
+    changelog_path = os.path.join(proj_dir, "CHANGELOG.md")
+    clean_ver = version.lstrip("vV").strip()
+    section_header = f"## [v{clean_ver}]"
+
+    if os.path.exists(changelog_path):
+        with open(changelog_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        if section_header in content:
+            start = content.index(section_header)
+            after_header = content.find("\n", start)
+            next_sec = content.find("\n## [", after_header if after_header != -1 else start)
+            body = content[after_header:next_sec] if next_sec != -1 else content[after_header:]
+            body = body.strip().strip("-").strip()
+            if body and not custom_notes:
+                return body
+
+    notes_to_use = custom_notes or (
+        "- **Bolinha verde de notificação de atualização na bandeja** (`#22C55E`).\n"
+        "- **Ícone dinâmico na bandeja:** Vermelho quando o microfone está ligado e Azul quando desligado.\n"
+        "- **Janela explícita de aceitação (`Sim` / `Não`)** antes de baixar e atualizar."
+    )
+
+    import datetime
+    today_br = datetime.date.today().strftime("%d/%m/%Y")
+    new_entry = f"## [v{clean_ver}] — {today_br}\n\n{notes_to_use.strip()}\n\n---\n\n"
+
+    if os.path.exists(changelog_path):
+        with open(changelog_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if section_header not in content:
+            marker = "---\n\n"
+            if marker in content:
+                idx = content.index(marker) + len(marker)
+                content = content[:idx] + new_entry + content[idx:]
+            else:
+                content = content + "\n\n" + new_entry
+            with open(changelog_path, "w", encoding="utf-8") as f:
+                f.write(content)
+    else:
+        with open(changelog_path, "w", encoding="utf-8") as f:
+            f.write(f"# Changelog — VozWindows\n\n---\n\n{new_entry}")
+
+    return notes_to_use
+
+
+def sync_git_repository(proj_dir: str, version: str, notes: str) -> None:
     git_dir = os.path.join(proj_dir, ".git")
     if not os.path.isdir(git_dir):
         return
+    clean_ver = version.lstrip("vV").strip()
+    tag = f"v{clean_ver}"
     status_res = subprocess.run(["git", "status", "--porcelain"], cwd=proj_dir, capture_output=True, text=True)
     if status_res.returncode == 0 and status_res.stdout.strip():
         subprocess.run(["git", "add", "-A"], cwd=proj_dir, check=False)
+        first_line = next((ln.strip().lstrip("-* ") for ln in notes.splitlines() if ln.strip() and not ln.startswith("#")), "Atualizacao de versao")
+        commit_msg = f"Release {tag} — Changelog: {first_line}"
         subprocess.run(
-            ["git", "commit", "-m", f"Release v{version.lstrip('vV')}"],
+            ["git", "commit", "-m", commit_msg, "-m", notes.strip()],
             cwd=proj_dir,
             check=False,
         )
+    subprocess.run(["git", "tag", "-f", tag, "HEAD"], cwd=proj_dir, check=False)
     subprocess.run(["git", "push", "origin", "master"], cwd=proj_dir, check=False)
+    subprocess.run(["git", "push", "origin", tag, "--force"], cwd=proj_dir, check=False)
 
 
 def main() -> int:
@@ -393,13 +446,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--notes",
-        default=(
-            "### Novidades desta versão\n"
-            "- **Auto-Update integrado em 1 clique** via GitHub Releases.\n"
-            "- **6 novas opções de reescrita ao vivo** focadas em comunicação técnica, didática e operacional.\n"
-            "- **Versão portátil 100% dedicada à voz** (estabilidade de janela e cursor)."
-        ),
-        help="Notas da versao em Markdown.",
+        default=None,
+        help="Notas da versao em Markdown (se omitido, usa a secao correspondente do CHANGELOG.md).",
     )
     args = parser.parse_args()
 
@@ -410,6 +458,7 @@ def main() -> int:
         update_csproj_version(csproj_path, args.version)
 
     version = read_csproj_version(csproj_path)
+    notes = extract_or_update_changelog(proj_dir, version, args.notes)
     exe_path = os.path.join(proj_dir, "bin", "Portatil", "VozWindows.exe")
 
     if not args.skip_build or not os.path.exists(exe_path):
@@ -417,8 +466,8 @@ def main() -> int:
 
     gh_token = read_vault_secret(GITHUB_CRED_TARGET)
     ensure_github_repo(gh_token)
-    sync_git_repository(proj_dir, version)
-    publish_github_release(gh_token, version, exe_path, args.notes)
+    sync_git_repository(proj_dir, version, notes)
+    publish_github_release(gh_token, version, exe_path, notes)
     return 0
 
 

@@ -1602,12 +1602,12 @@ public sealed class MainWindow : Window
                 g.DrawLine(whitePen, 11.5f, 24f, 19.5f, 24f);
             }
 
-            // Red Notification Badge Dot on top-right corner when an update is pending
+            // Green Notification Badge Dot on top-right corner when an update is pending
             if (hasPendingUpdate)
             {
                 using var shadowBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(220, 11, 11, 13));
                 using var haloBrush = new System.Drawing.SolidBrush(System.Drawing.Color.White);
-                using var badgeBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(255, 255, 23, 68)); // #FF1744 Vivid Notification Red
+                using var badgeBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(255, 34, 197, 94)); // #22C55E Vivid Emerald Green
                 g.FillEllipse(shadowBrush, 16f, 0f, 16f, 16f);
                 g.FillEllipse(haloBrush, 17f, 0.5f, 14.5f, 14.5f);
                 g.FillEllipse(badgeBrush, 19.2f, 2.7f, 10.1f, 10.1f);
@@ -1885,12 +1885,13 @@ public sealed class MainWindow : Window
 
     public void SimulateUpdateNotificationPreview()
     {
+        var nextVer = new Version(AutoUpdateService.CurrentVersion.Major, AutoUpdateService.CurrentVersion.Minor + 1, 0);
         var simulated = new UpdateReleaseInfo(
-            "v1.2.0 (Simulação)",
-            new Version(1, 2, 0),
+            $"v{nextVer.Major}.{nextVer.Minor}.{nextVer.Build} (Simulação)",
+            nextVer,
             "SIMULATED_PREVIEW",
             0,
-            "- Melhorias nas 6 opções de linguagem técnica e operacional\n- Correções de estabilidade e desempenho");
+            "- Bolinha verde de notificação de atualização no ícone da bandeja\n- Ícone da bandeja Vermelho (microfone ligado) e Azul (desligado)");
         _pendingUpdateRelease = simulated;
         _rewriteDeck.ShowUpdateAvailable(simulated.TagName, simulated.Notes);
         RefreshTrayIconVisual();

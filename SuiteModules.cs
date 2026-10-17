@@ -414,10 +414,18 @@ public sealed record UpdateReleaseInfo(
 
 public static class AutoUpdateService
 {
-    public const string CurrentVersionString = "1.1.0";
-    public static readonly Version CurrentVersion = new(1, 1, 0);
+    public static readonly Version CurrentVersion = GetAssemblyThreePartVersion();
+    public static readonly string CurrentVersionString = $"{CurrentVersion.Major}.{CurrentVersion.Minor}.{CurrentVersion.Build}";
     public const string GitHubRepo = "douglasescrito/voz-windows";
     public const string LatestReleaseApiUrl = "https://api.github.com/repos/douglasescrito/voz-windows/releases/latest";
+
+    private static Version GetAssemblyThreePartVersion()
+    {
+        var v = typeof(AutoUpdateService).Assembly.GetName().Version;
+        if (v == null)
+            return new Version(1, 2, 0);
+        return new Version(Math.Max(1, v.Major), Math.Max(0, v.Minor), Math.Max(0, v.Build));
+    }
 
     private static readonly HttpClient UpdateHttp = CreateHttpClient();
 
