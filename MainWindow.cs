@@ -729,6 +729,7 @@ public sealed class MainWindow : Window
         _statusText.Text = "OUVINDO AO VIVO • Qualidade máxima sem reescrita (gemini-3.5-transcribe-live)";
         _livePreviewText.Text = "Estou ouvindo... fale agora.";
         _livePreviewText.Foreground = BrushWhiteText;
+        RefreshTrayIconVisual();
 
         try
         {
@@ -1427,6 +1428,7 @@ public sealed class MainWindow : Window
         _outerBorder.BorderBrush = BrushDarkBorder;
         _statusDot.Fill = new SolidColorBrush(Color.FromRgb(34, 197, 94));
         _statusText.Text = statusMsg;
+        RefreshTrayIconVisual();
     }
 
     public void CycleCursorLoopModeOnBar()
@@ -1511,33 +1513,124 @@ public sealed class MainWindow : Window
         ipcThread.Start();
     }
 
+    private IntPtr _currentTrayHIcon = IntPtr.Zero;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+
     private void UpdateTrayTooltip()
     {
         if (_trayIcon == null) return;
-        _trayIcon.Text = $"VozWindows • Clique para Maximizar/Minimizar Barra Lateral • {_cursorSettings.GetModePillText()}";
+        string micState = _isListening ? "🔴 Microfone LIGADO" : "🔵 Microfone DESLIGADO";
+        string updateState = _pendingUpdateRelease != null ? $" • ⬆️ Atualização {_pendingUpdateRelease.TagName}" : string.Empty;
+        string text = $"VozWindows • {micState}{updateState}";
+        if (text.Length > 63)
+            text = text[..63];
+        _trayIcon.Text = text;
+    }
+
+    private void RefreshTrayIconVisual()
+    {
+        try
+        {
+            if (_trayIcon == null)
+                return;
+
+            bool hasUpdate = _pendingUpdateRelease != null;
+            var (newIcon, newHIcon) = CreateDynamicTrayIcon(_isListening, hasUpdate);
+            var oldIcon = _trayIcon.Icon;
+            IntPtr oldHIcon = _currentTrayHIcon;
+
+            _trayIcon.Icon = newIcon;
+            _currentTrayHIcon = newHIcon;
+            UpdateTrayTooltip();
+
+            if (oldIcon != null && !ReferenceEquals(oldIcon, System.Drawing.SystemIcons.Application))
+            {
+                try { oldIcon.Dispose(); } catch { }
+            }
+            if (oldHIcon != IntPtr.Zero)
+            {
+                try { DestroyIcon(oldHIcon); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    private static (System.Drawing.Icon Icon, IntPtr HIcon) CreateDynamicTrayIcon(bool isMicActive, bool hasPendingUpdate)
+    {
+        using var bmp = new System.Drawing.Bitmap(32, 32, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using (var g = System.Drawing.Graphics.FromImage(bmp))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.Clear(System.Drawing.Color.Transparent);
+
+            // Base circle: Red when microphone is ON, Blue when microphone is OFF
+            System.Drawing.Color mainFill = isMicActive
+                ? System.Drawing.Color.FromArgb(255, 220, 38, 38)   // #DC2626 Red (Mic ON)
+                : System.Drawing.Color.FromArgb(255, 37, 99, 235);  // #2563EB Blue (Mic OFF)
+
+            System.Drawing.Color borderStroke = isMicActive
+                ? System.Drawing.Color.FromArgb(255, 252, 165, 165) // #FCA5A5 Light Red Ring
+                : System.Drawing.Color.FromArgb(255, 96, 165, 250); // #60A5FA Light Blue Ring
+
+            using (var bgBrush = new System.Drawing.SolidBrush(mainFill))
+            using (var borderPen = new System.Drawing.Pen(borderStroke, 1.8f))
+            {
+                g.FillEllipse(bgBrush, 2, 2, 27, 27);
+                g.DrawEllipse(borderPen, 2, 2, 27, 27);
+            }
+
+            // Crisp White Studio Microphone Silhouette in Center
+            using (var whiteBrush = new System.Drawing.SolidBrush(System.Drawing.Color.White))
+            using (var whitePen = new System.Drawing.Pen(System.Drawing.Color.White, 2.3f)
+            {
+                StartCap = System.Drawing.Drawing2D.LineCap.Round,
+                EndCap = System.Drawing.Drawing2D.LineCap.Round
+            })
+            {
+                // Capsule body
+                g.FillEllipse(whiteBrush, 12.5f, 7f, 6f, 5.5f);
+                g.FillRectangle(whiteBrush, 12.5f, 9.5f, 6f, 5.5f);
+                g.FillEllipse(whiteBrush, 12.5f, 12.2f, 6f, 5.5f);
+
+                // U-shaped cradle arc
+                g.DrawArc(whitePen, 9.5f, 9.5f, 12f, 11f, 0, 180);
+
+                // Stand stem & base
+                g.DrawLine(whitePen, 15.5f, 20.5f, 15.5f, 24f);
+                g.DrawLine(whitePen, 11.5f, 24f, 19.5f, 24f);
+            }
+
+            // Red Notification Badge Dot on top-right corner when an update is pending
+            if (hasPendingUpdate)
+            {
+                using var shadowBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(220, 11, 11, 13));
+                using var haloBrush = new System.Drawing.SolidBrush(System.Drawing.Color.White);
+                using var badgeBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(255, 255, 23, 68)); // #FF1744 Vivid Notification Red
+                g.FillEllipse(shadowBrush, 16f, 0f, 16f, 16f);
+                g.FillEllipse(haloBrush, 17f, 0.5f, 14.5f, 14.5f);
+                g.FillEllipse(badgeBrush, 19.2f, 2.7f, 10.1f, 10.1f);
+            }
+        }
+
+        IntPtr hIcon = bmp.GetHicon();
+        var managedIcon = (System.Drawing.Icon)System.Drawing.Icon.FromHandle(hIcon).Clone();
+        return (managedIcon, hIcon);
     }
 
     private void SetupSystemTray()
     {
-        System.Drawing.Icon trayIco = System.Drawing.SystemIcons.Application;
-        try
-        {
-            string? exePath = Environment.ProcessPath;
-            if (!string.IsNullOrEmpty(exePath) && File.Exists(exePath))
-            {
-                trayIco = System.Drawing.Icon.ExtractAssociatedIcon(exePath) ?? System.Drawing.SystemIcons.Application;
-            }
-        }
-        catch { }
+        var (initialIcon, initialHIcon) = CreateDynamicTrayIcon(_isListening, _pendingUpdateRelease != null);
+        _currentTrayHIcon = initialHIcon;
 
         _trayIcon = new System.Windows.Forms.NotifyIcon
         {
-            Text = CursorLoopSettings.IsCursorLoopSupported
-                ? $"VozWindows • Clique para Maximizar/Minimizar Barra Lateral • {_cursorSettings.GetModePillText()}"
-                : "VozWindows • Clique para Maximizar/Minimizar Barra Lateral (F8 para Ditado)",
-            Icon = trayIco,
+            Text = "VozWindows • 🔵 Microfone DESLIGADO",
+            Icon = initialIcon,
             Visible = true
         };
+        UpdateTrayTooltip();
 
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("📌 Maximizar na Barra Lateral / Minimizar para a Bandeja", null, (_, _) => Dispatcher.BeginInvoke(ToggleSidebarOrTray));
@@ -1760,6 +1853,11 @@ public sealed class MainWindow : Window
                 _trayIcon.Visible = false;
                 _trayIcon.Dispose();
             }
+            if (_currentTrayHIcon != IntPtr.Zero)
+            {
+                DestroyIcon(_currentTrayHIcon);
+                _currentTrayHIcon = IntPtr.Zero;
+            }
         }
         catch { }
 
@@ -1795,6 +1893,7 @@ public sealed class MainWindow : Window
             "- Melhorias nas 6 opções de linguagem técnica e operacional\n- Correções de estabilidade e desempenho");
         _pendingUpdateRelease = simulated;
         _rewriteDeck.ShowUpdateAvailable(simulated.TagName, simulated.Notes);
+        RefreshTrayIconVisual();
         _statusText.Text = "⬆️ NOVA ATUALIZAÇÃO DISPONÍVEL • CLIQUE NO BANNER VERDE ACIMA PARA ACEITAR";
         try
         {
@@ -1820,6 +1919,7 @@ public sealed class MainWindow : Window
             _ = Dispatcher.BeginInvoke(() =>
             {
                 _rewriteDeck.ShowUpdateAvailable(release.TagName, release.Notes);
+                RefreshTrayIconVisual();
                 _statusText.Text = $"⬆️ ATUALIZAÇÃO {release.TagName} DISPONÍVEL • CLIQUE NO BOTÃO VERDE PARA ACEITAR";
                 if (isNewNotice)
                 {
@@ -1882,6 +1982,7 @@ public sealed class MainWindow : Window
                 MessageBoxImage.Information);
             _pendingUpdateRelease = null;
             _rewriteDeck.HideUpdateBanner();
+            RefreshTrayIconVisual();
             _statusText.Text = $"PRONTO • SIMULAÇÃO DE ATUALIZAÇÃO CONCLUÍDA (v{AutoUpdateService.CurrentVersionString})";
             return;
         }
