@@ -1552,7 +1552,8 @@ public sealed class MainWindow : Window
             menu.Items.Add("   • Desativar CursorLoop (OFF) [Ctrl+Alt+0]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(0)));
         }
         menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
-        menu.Items.Add($"🔄 Verificar Atualização (Atual: v{AutoUpdateService.CurrentVersionString})", null, (_, _) => Dispatcher.BeginInvoke(async () => await CheckForUpdateBackgroundAsync()));
+        menu.Items.Add($"🔄 Verificar Atualização (Atual: v{AutoUpdateService.CurrentVersionString})", null, (_, _) => Dispatcher.BeginInvoke(async () => await CheckForUpdateBackgroundAsync(showUpToDateFeedback: true)));
+        menu.Items.Add("👁️ Pré-visualizar Aviso de Atualização (Simulação)", null, (_, _) => Dispatcher.BeginInvoke(SimulateUpdateNotificationPreview));
         menu.Items.Add("🔑 Atualizar Chave da Área de Transferência", null, (_, _) => Dispatcher.BeginInvoke(ImportKeyFromClipboard));
         menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
         menu.Items.Add("✕ Sair de Tudo", null, (_, _) => Dispatcher.BeginInvoke(async () =>
@@ -1567,6 +1568,14 @@ public sealed class MainWindow : Window
             {
                 Dispatcher.BeginInvoke(ToggleSidebarOrTray);
             }
+        };
+        _trayIcon.BalloonTipClicked += (_, _) =>
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (!IsVisible)
+                    ToggleSidebarOrTray();
+            });
         };
 
         PromoteTrayIconNextToClock();
@@ -1759,6 +1768,12 @@ public sealed class MainWindow : Window
 
     private void StartAutoUpdateChecker()
     {
+        string[] cmdArgs = Environment.GetCommandLineArgs();
+        if (Array.Exists(cmdArgs, a => a.Equals("--preview-update", StringComparison.OrdinalIgnoreCase)))
+        {
+            Dispatcher.BeginInvoke(SimulateUpdateNotificationPreview);
+        }
+
         _ = Task.Run(async () =>
         {
             await Task.Delay(3500);
@@ -1770,7 +1785,29 @@ public sealed class MainWindow : Window
         });
     }
 
-    private async Task CheckForUpdateBackgroundAsync()
+    public void SimulateUpdateNotificationPreview()
+    {
+        var simulated = new UpdateReleaseInfo(
+            "v1.2.0 (Simulação)",
+            new Version(1, 2, 0),
+            "SIMULATED_PREVIEW",
+            0,
+            "- Melhorias nas 6 opções de linguagem técnica e operacional\n- Correções de estabilidade e desempenho");
+        _pendingUpdateRelease = simulated;
+        _rewriteDeck.ShowUpdateAvailable(simulated.TagName, simulated.Notes);
+        _statusText.Text = "⬆️ NOVA ATUALIZAÇÃO DISPONÍVEL • CLIQUE NO BANNER VERDE ACIMA PARA ACEITAR";
+        try
+        {
+            _trayIcon?.ShowBalloonTip(
+                4000,
+                $"VozWindows — Nova versão disponível ({simulated.TagName})",
+                "Clique no botão verde no topo da barra lateral para revisar e aceitar a atualização.",
+                System.Windows.Forms.ToolTipIcon.Info);
+        }
+        catch { }
+    }
+
+    private async Task CheckForUpdateBackgroundAsync(bool showUpToDateFeedback = false)
     {
         if (_isUpdatingApp || _isClosingApp)
             return;
@@ -1778,10 +1815,31 @@ public sealed class MainWindow : Window
         var release = await AutoUpdateService.CheckForUpdateAsync();
         if (release != null)
         {
+            bool isNewNotice = _pendingUpdateRelease?.TagName != release.TagName;
             _pendingUpdateRelease = release;
             _ = Dispatcher.BeginInvoke(() =>
             {
-                _rewriteDeck.ShowUpdateAvailable(release.TagName);
+                _rewriteDeck.ShowUpdateAvailable(release.TagName, release.Notes);
+                _statusText.Text = $"⬆️ ATUALIZAÇÃO {release.TagName} DISPONÍVEL • CLIQUE NO BOTÃO VERDE PARA ACEITAR";
+                if (isNewNotice)
+                {
+                    try
+                    {
+                        _trayIcon?.ShowBalloonTip(
+                            5000,
+                            $"VozWindows — Nova atualização ({release.TagName})",
+                            "Uma nova versão está disponível. Clique no botão verde na barra lateral para aceitar e atualizar.",
+                            System.Windows.Forms.ToolTipIcon.Info);
+                    }
+                    catch { }
+                }
+            });
+        }
+        else if (showUpToDateFeedback)
+        {
+            _ = Dispatcher.BeginInvoke(() =>
+            {
+                _statusText.Text = $"✓ VOCÊ JÁ ESTÁ NA VERSÃO MAIS RECENTE (v{AutoUpdateService.CurrentVersionString})";
             });
         }
     }
@@ -1791,6 +1849,42 @@ public sealed class MainWindow : Window
         var release = _pendingUpdateRelease;
         if (release == null || _isUpdatingApp)
             return;
+
+        string notesBlock = string.IsNullOrWhiteSpace(release.Notes)
+            ? "• Melhorias gerais de estabilidade e desempenho."
+            : release.Notes.Trim();
+
+        var answer = MessageBox.Show(
+            this,
+            $"Uma nova versão do VozWindows está disponível!\n\n" +
+            $"• Sua versão atual: v{AutoUpdateService.CurrentVersionString}\n" +
+            $"• Nova versão: {release.TagName}\n\n" +
+            $"Novidades:\n{notesBlock}\n\n" +
+            $"Deseja baixar e instalar esta atualização agora?",
+            "Confirmar Atualização do VozWindows",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Information);
+
+        if (answer != MessageBoxResult.Yes)
+        {
+            _statusText.Text = "ATUALIZAÇÃO ADIADA PELO USUÁRIO • O BOTÃO CONTINUA DISPONÍVEL QUANDO QUISER";
+            return;
+        }
+
+        if (release.DownloadUrl == "SIMULATED_PREVIEW")
+        {
+            MessageBox.Show(
+                this,
+                "Simulação concluída com sucesso!\n\n" +
+                "Quando você publicar uma versão real (ex: v1.2.0) no GitHub, clicar em 'Sim' fará o download automático do novo VozWindows.exe e reiniciará o aplicativo atualizado.",
+                "Pré-visualização do Auto-Update",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            _pendingUpdateRelease = null;
+            _rewriteDeck.HideUpdateBanner();
+            _statusText.Text = $"PRONTO • SIMULAÇÃO DE ATUALIZAÇÃO CONCLUÍDA (v{AutoUpdateService.CurrentVersionString})";
+            return;
+        }
 
         _isUpdatingApp = true;
         try

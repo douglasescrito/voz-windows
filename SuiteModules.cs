@@ -409,7 +409,8 @@ public sealed record UpdateReleaseInfo(
     string TagName,
     Version Version,
     string DownloadUrl,
-    long SizeBytes);
+    long SizeBytes,
+    string? Notes = null);
 
 public static class AutoUpdateService
 {
@@ -487,6 +488,8 @@ public static class AutoUpdateService
             if (remoteVersion <= CurrentVersion)
                 return null;
 
+            string? notes = root.TryGetProperty("body", out JsonElement bodyElem) ? bodyElem.GetString() : null;
+
             if (!root.TryGetProperty("assets", out JsonElement assetsElem) || assetsElem.ValueKind != JsonValueKind.Array)
                 return null;
 
@@ -498,7 +501,7 @@ public static class AutoUpdateService
 
                 if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(url))
                 {
-                    return new UpdateReleaseInfo(tagName, remoteVersion, url, size);
+                    return new UpdateReleaseInfo(tagName, remoteVersion, url, size, notes);
                 }
             }
         }
