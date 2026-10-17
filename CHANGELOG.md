@@ -4,6 +4,14 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.2.1] — 17/10/2026
+
+- ✅ **Teste ao vivo de Atualização Automática (v1.2.1):** se este aviso apareceu na sua barra lateral e a bolinha verde acendeu no ícone perto do relógio, o Auto-Update está funcionando!
+- ⚡ **Verificação acelerada:** checagem automática de novas versões a cada 2 minutos em segundo plano.
+- 🎯 **Como concluir o teste:** clique em **Sim** abaixo para o aplicativo baixar a v1.2.1 sozinho, reiniciar atualizado e confirmar que o topo mudou para **v1.2.1**!
+
+---
+
 ## [v1.2.0] — 17/10/2026
 
 - **Bolinha verde de notificação de atualização na bandeja:** quando há uma nova versão disponível no GitHub, o ícone ao lado do relógio exibe uma bolinha verde esmeralda (`#22C55E`) com aro branco no canto superior direito.

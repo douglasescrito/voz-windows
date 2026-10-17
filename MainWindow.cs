@@ -1878,7 +1878,7 @@ public sealed class MainWindow : Window
             while (!_isClosingApp)
             {
                 await CheckForUpdateBackgroundAsync();
-                await Task.Delay(TimeSpan.FromMinutes(10));
+                await Task.Delay(TimeSpan.FromMinutes(2));
             }
         });
     }
