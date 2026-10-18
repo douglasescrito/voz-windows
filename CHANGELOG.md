@@ -4,6 +4,13 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.0] — 17/10/2026
+
+- 🔔 **Contador de atualizações acumuladas (1, 2, 3...):** a bolinha verde no ícone perto do relógio e o botão verde na barra lateral agora mostram quantas versões pendentes estão acumuladas.
+- 📋 **Resumo consolidado de todas as versões:** ao clicar para atualizar, exibe todas as novidades das versões que você pulou e instala direto a mais recente de uma só vez.
+
+---
+
 ## [v1.2.1] — 17/10/2026
 
 - ✅ **Teste ao vivo de Atualização Automática (v1.2.1):** se este aviso apareceu na sua barra lateral e a bolinha verde acendeu no ícone perto do relógio, o Auto-Update está funcionando!

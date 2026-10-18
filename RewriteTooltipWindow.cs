@@ -761,12 +761,21 @@ public sealed class RewriteDeckView : Border
         _btnRestorePrevious.Visibility = available ? Visibility.Visible : Visibility.Collapsed;
     }
 
-    public void ShowUpdateAvailable(string tagName, string? releaseNotes = null)
+    public void ShowUpdateAvailable(string tagName, string? releaseNotes = null, int pendingCount = 1)
     {
-        _btnUpdateBanner.Content = $"⬆️ Nova atualização disponível ({tagName}) — Clique para revisar e atualizar";
+        int count = Math.Max(1, pendingCount);
+        string badgeLabel = count > 9 ? "9+" : count.ToString();
+        _btnUpdateBanner.Content = count == 1
+            ? $"🔔 [{badgeLabel}] Nova atualização disponível ({tagName}) — Clique para revisar"
+            : $"🔔 [{badgeLabel}] {count} atualizações acumuladas (até {tagName}) — Clique para atualizar";
+
+        string countHeader = count == 1
+            ? $"1 nova atualização disponível ({tagName}):"
+            : $"{count} atualizações acumuladas (instalando direto a {tagName}):";
+
         _btnUpdateBanner.ToolTip = string.IsNullOrWhiteSpace(releaseNotes)
-            ? $"Clique para revisar e aceitar a atualização para a versão {tagName}"
-            : $"Novidades da versão {tagName}:\n{releaseNotes.Trim()}\n\nClique para revisar e aceitar a atualização.";
+            ? $"{countHeader}\nClique para revisar e aceitar a atualização."
+            : $"{countHeader}\n{releaseNotes.Trim()}\n\nClique para revisar e aceitar a atualização.";
         _btnUpdateBanner.IsEnabled = true;
         _btnUpdateBanner.Visibility = Visibility.Visible;
     }

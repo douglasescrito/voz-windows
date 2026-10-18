@@ -410,7 +410,8 @@ public sealed record UpdateReleaseInfo(
     Version Version,
     string DownloadUrl,
     long SizeBytes,
-    string? Notes = null);
+    string? Notes = null,
+    int PendingCount = 1);
 
 public static class AutoUpdateService
 {
@@ -418,12 +419,13 @@ public static class AutoUpdateService
     public static readonly string CurrentVersionString = $"{CurrentVersion.Major}.{CurrentVersion.Minor}.{CurrentVersion.Build}";
     public const string GitHubRepo = "douglasescrito/voz-windows";
     public const string LatestReleaseApiUrl = "https://api.github.com/repos/douglasescrito/voz-windows/releases/latest";
+    public const string ReleasesListApiUrl = "https://api.github.com/repos/douglasescrito/voz-windows/releases?per_page=30";
 
     private static Version GetAssemblyThreePartVersion()
     {
         var v = typeof(AutoUpdateService).Assembly.GetName().Version;
         if (v == null)
-            return new Version(1, 2, 0);
+            return new Version(1, 3, 0);
         return new Version(Math.Max(1, v.Major), Math.Max(0, v.Minor), Math.Max(0, v.Build));
     }
 
@@ -469,49 +471,94 @@ public static class AutoUpdateService
     }
 
     /// <summary>
-    /// Consulta silenciosamente a última Release publicada no GitHub (douglasescrito/voz-windows).
-    /// Retorna os dados da atualização somente se houver uma versão mais nova que CurrentVersion.
+    /// Consulta a lista de Releases publicadas no GitHub (douglasescrito/voz-windows),
+    /// conta quantas versões acima de CurrentVersion estão acumuladas e retorna o executável mais recente
+    /// junto com o resumo acumulado de todas as versões pendentes.
     /// </summary>
     public static async Task<UpdateReleaseInfo?> CheckForUpdateAsync(CancellationToken ct = default)
     {
         try
         {
-            using var req = new HttpRequestMessage(HttpMethod.Get, LatestReleaseApiUrl);
+            using var req = new HttpRequestMessage(HttpMethod.Get, ReleasesListApiUrl);
             using var resp = await UpdateHttp.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct);
             if (!resp.IsSuccessStatusCode)
                 return null;
 
             string json = await resp.Content.ReadAsStringAsync(ct);
             using var doc = JsonDocument.Parse(json);
-            JsonElement root = doc.RootElement;
-
-            if (!root.TryGetProperty("tag_name", out JsonElement tagElem))
+            if (doc.RootElement.ValueKind != JsonValueKind.Array)
                 return null;
 
-            string tagName = (tagElem.GetString() ?? string.Empty).Trim();
-            string cleanVer = tagName.TrimStart('v', 'V').Split('-')[0].Trim();
-            if (!Version.TryParse(cleanVer, out Version? remoteVersion) || remoteVersion == null)
-                return null;
+            var newerReleases = new System.Collections.Generic.List<(string Tag, Version Ver, string Url, long Size, string? Body)>();
 
-            if (remoteVersion <= CurrentVersion)
-                return null;
-
-            string? notes = root.TryGetProperty("body", out JsonElement bodyElem) ? bodyElem.GetString() : null;
-
-            if (!root.TryGetProperty("assets", out JsonElement assetsElem) || assetsElem.ValueKind != JsonValueKind.Array)
-                return null;
-
-            foreach (JsonElement asset in assetsElem.EnumerateArray())
+            foreach (JsonElement rel in doc.RootElement.EnumerateArray())
             {
-                string name = asset.TryGetProperty("name", out JsonElement n) ? (n.GetString() ?? string.Empty) : string.Empty;
-                string url = asset.TryGetProperty("browser_download_url", out JsonElement u) ? (u.GetString() ?? string.Empty) : string.Empty;
-                long size = asset.TryGetProperty("size", out JsonElement s) && s.TryGetInt64(out long sz) ? sz : 0;
+                if (rel.TryGetProperty("draft", out JsonElement d) && d.ValueKind == JsonValueKind.True)
+                    continue;
 
-                if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(url))
+                if (!rel.TryGetProperty("tag_name", out JsonElement tagElem))
+                    continue;
+
+                string tagName = (tagElem.GetString() ?? string.Empty).Trim();
+                string cleanVer = tagName.TrimStart('v', 'V').Split('-')[0].Trim();
+                if (!Version.TryParse(cleanVer, out Version? remoteVersion) || remoteVersion == null)
+                    continue;
+
+                if (remoteVersion <= CurrentVersion)
+                    continue;
+
+                if (!rel.TryGetProperty("assets", out JsonElement assetsElem) || assetsElem.ValueKind != JsonValueKind.Array)
+                    continue;
+
+                string? exeUrl = null;
+                long exeSize = 0;
+                foreach (JsonElement asset in assetsElem.EnumerateArray())
                 {
-                    return new UpdateReleaseInfo(tagName, remoteVersion, url, size, notes);
+                    string name = asset.TryGetProperty("name", out JsonElement n) ? (n.GetString() ?? string.Empty) : string.Empty;
+                    string url = asset.TryGetProperty("browser_download_url", out JsonElement u) ? (u.GetString() ?? string.Empty) : string.Empty;
+                    long size = asset.TryGetProperty("size", out JsonElement s) && s.TryGetInt64(out long sz) ? sz : 0;
+
+                    if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(url))
+                    {
+                        exeUrl = url;
+                        exeSize = size;
+                        break;
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(exeUrl))
+                {
+                    string? body = rel.TryGetProperty("body", out JsonElement bodyElem) ? bodyElem.GetString() : null;
+                    newerReleases.Add((tagName, remoteVersion, exeUrl, exeSize, body));
                 }
             }
+
+            if (newerReleases.Count == 0)
+                return null;
+
+            newerReleases.Sort((a, b) => b.Ver.CompareTo(a.Ver));
+            var latest = newerReleases[0];
+            int pendingCount = newerReleases.Count;
+
+            string combinedNotes;
+            if (pendingCount == 1)
+            {
+                combinedNotes = latest.Body ?? string.Empty;
+            }
+            else
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var item in newerReleases)
+                {
+                    if (sb.Length > 0)
+                        sb.AppendLine().AppendLine();
+                    sb.AppendLine($"[{item.Tag}]");
+                    sb.Append(string.IsNullOrWhiteSpace(item.Body) ? "• Melhorias e correções." : item.Body.Trim());
+                }
+                combinedNotes = sb.ToString();
+            }
+
+            return new UpdateReleaseInfo(latest.Tag, latest.Ver, latest.Url, latest.Size, combinedNotes, pendingCount);
         }
         catch
         {

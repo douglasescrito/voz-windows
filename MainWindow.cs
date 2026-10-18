@@ -1522,7 +1522,9 @@ public sealed class MainWindow : Window
     {
         if (_trayIcon == null) return;
         string micState = _isListening ? "🔴 Microfone LIGADO" : "🔵 Microfone DESLIGADO";
-        string updateState = _pendingUpdateRelease != null ? $" • ⬆️ Atualização {_pendingUpdateRelease.TagName}" : string.Empty;
+        string updateState = _pendingUpdateRelease != null
+            ? $" • 🔔 {_pendingUpdateRelease.PendingCount} att ({_pendingUpdateRelease.TagName})"
+            : string.Empty;
         string text = $"VozWindows • {micState}{updateState}";
         if (text.Length > 63)
             text = text[..63];
@@ -1536,8 +1538,8 @@ public sealed class MainWindow : Window
             if (_trayIcon == null)
                 return;
 
-            bool hasUpdate = _pendingUpdateRelease != null;
-            var (newIcon, newHIcon) = CreateDynamicTrayIcon(_isListening, hasUpdate);
+            int pendingCount = _pendingUpdateRelease?.PendingCount ?? 0;
+            var (newIcon, newHIcon) = CreateDynamicTrayIcon(_isListening, pendingCount);
             var oldIcon = _trayIcon.Icon;
             IntPtr oldHIcon = _currentTrayHIcon;
 
@@ -1557,12 +1559,13 @@ public sealed class MainWindow : Window
         catch { }
     }
 
-    private static (System.Drawing.Icon Icon, IntPtr HIcon) CreateDynamicTrayIcon(bool isMicActive, bool hasPendingUpdate)
+    private static (System.Drawing.Icon Icon, IntPtr HIcon) CreateDynamicTrayIcon(bool isMicActive, int pendingUpdateCount)
     {
         using var bmp = new System.Drawing.Bitmap(32, 32, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         using (var g = System.Drawing.Graphics.FromImage(bmp))
         {
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
             g.Clear(System.Drawing.Color.Transparent);
 
             // Base circle: Red when microphone is ON, Blue when microphone is OFF
@@ -1577,40 +1580,53 @@ public sealed class MainWindow : Window
             using (var bgBrush = new System.Drawing.SolidBrush(mainFill))
             using (var borderPen = new System.Drawing.Pen(borderStroke, 1.8f))
             {
-                g.FillEllipse(bgBrush, 2, 2, 27, 27);
-                g.DrawEllipse(borderPen, 2, 2, 27, 27);
+                g.FillEllipse(bgBrush, 1.5f, 2.5f, 26.5f, 26.5f);
+                g.DrawEllipse(borderPen, 1.5f, 2.5f, 26.5f, 26.5f);
             }
 
             // Crisp White Studio Microphone Silhouette in Center
             using (var whiteBrush = new System.Drawing.SolidBrush(System.Drawing.Color.White))
-            using (var whitePen = new System.Drawing.Pen(System.Drawing.Color.White, 2.3f)
+            using (var whitePen = new System.Drawing.Pen(System.Drawing.Color.White, 2.2f)
             {
                 StartCap = System.Drawing.Drawing2D.LineCap.Round,
                 EndCap = System.Drawing.Drawing2D.LineCap.Round
             })
             {
                 // Capsule body
-                g.FillEllipse(whiteBrush, 12.5f, 7f, 6f, 5.5f);
-                g.FillRectangle(whiteBrush, 12.5f, 9.5f, 6f, 5.5f);
-                g.FillEllipse(whiteBrush, 12.5f, 12.2f, 6f, 5.5f);
+                g.FillEllipse(whiteBrush, 11.8f, 7.5f, 5.8f, 5.2f);
+                g.FillRectangle(whiteBrush, 11.8f, 10.0f, 5.8f, 5.2f);
+                g.FillEllipse(whiteBrush, 11.8f, 12.6f, 5.8f, 5.2f);
 
                 // U-shaped cradle arc
-                g.DrawArc(whitePen, 9.5f, 9.5f, 12f, 11f, 0, 180);
+                g.DrawArc(whitePen, 8.9f, 9.8f, 11.6f, 10.8f, 0, 180);
 
                 // Stand stem & base
-                g.DrawLine(whitePen, 15.5f, 20.5f, 15.5f, 24f);
-                g.DrawLine(whitePen, 11.5f, 24f, 19.5f, 24f);
+                g.DrawLine(whitePen, 14.7f, 20.6f, 14.7f, 24.0f);
+                g.DrawLine(whitePen, 10.9f, 24.0f, 18.5f, 24.0f);
             }
 
-            // Green Notification Badge Dot on top-right corner when an update is pending
-            if (hasPendingUpdate)
+            // Green Notification Badge Dot with Counter Number on top-right corner when updates are pending
+            if (pendingUpdateCount > 0)
             {
-                using var shadowBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(220, 11, 11, 13));
+                using var shadowBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(230, 11, 11, 13));
                 using var haloBrush = new System.Drawing.SolidBrush(System.Drawing.Color.White);
-                using var badgeBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(255, 34, 197, 94)); // #22C55E Vivid Emerald Green
-                g.FillEllipse(shadowBrush, 16f, 0f, 16f, 16f);
-                g.FillEllipse(haloBrush, 17f, 0.5f, 14.5f, 14.5f);
-                g.FillEllipse(badgeBrush, 19.2f, 2.7f, 10.1f, 10.1f);
+                using var badgeBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(255, 22, 163, 74)); // #16A34A Deep Emerald Green for high white-digit contrast
+
+                g.FillEllipse(shadowBrush, 13f, 0f, 19f, 19f);
+                g.FillEllipse(haloBrush, 14f, 0.5f, 17.5f, 17.5f);
+                g.FillEllipse(badgeBrush, 15.6f, 2.1f, 14.3f, 14.3f);
+
+                string badgeText = pendingUpdateCount > 9 ? "9+" : pendingUpdateCount.ToString();
+                float fontSizePx = badgeText.Length > 1 ? 8.8f : 10.8f;
+                using var font = new System.Drawing.Font("Segoe UI", fontSizePx, System.Drawing.FontStyle.Bold, System.Drawing.GraphicsUnit.Pixel);
+                using var sf = new System.Drawing.StringFormat
+                {
+                    Alignment = System.Drawing.StringAlignment.Center,
+                    LineAlignment = System.Drawing.StringAlignment.Center,
+                    FormatFlags = System.Drawing.StringFormatFlags.NoWrap
+                };
+                var textRect = new System.Drawing.RectangleF(15.2f, 2.0f, 15.2f, 14.8f);
+                g.DrawString(badgeText, font, System.Drawing.Brushes.White, textRect, sf);
             }
         }
 
@@ -1621,7 +1637,7 @@ public sealed class MainWindow : Window
 
     private void SetupSystemTray()
     {
-        var (initialIcon, initialHIcon) = CreateDynamicTrayIcon(_isListening, _pendingUpdateRelease != null);
+        var (initialIcon, initialHIcon) = CreateDynamicTrayIcon(_isListening, _pendingUpdateRelease?.PendingCount ?? 0);
         _currentTrayHIcon = initialHIcon;
 
         _trayIcon = new System.Windows.Forms.NotifyIcon
@@ -1883,24 +1899,36 @@ public sealed class MainWindow : Window
         });
     }
 
+    private int _simulatedPreviewStep;
+
     public void SimulateUpdateNotificationPreview()
     {
-        var nextVer = new Version(AutoUpdateService.CurrentVersion.Major, AutoUpdateService.CurrentVersion.Minor + 1, 0);
+        _simulatedPreviewStep = (_simulatedPreviewStep % 3) + 1;
+        int simCount = _simulatedPreviewStep;
+        var nextVer = new Version(AutoUpdateService.CurrentVersion.Major, AutoUpdateService.CurrentVersion.Minor + simCount, 0);
+        string simNotes = simCount == 1
+            ? "- Contador de atualizações acumuladas (1, 2, 3...) na bolinha verde da bandeja e no sininho da barra\n- Resumo acumulado de todas as versões pendentes"
+            : $"[v{nextVer.Major}.{nextVer.Minor}.0]\n• Contador numérico na bolinha verde da bandeja\n\n[v{nextVer.Major}.{nextVer.Minor - 1}.0]\n• Melhorias de estabilidade e velocidade";
+
         var simulated = new UpdateReleaseInfo(
             $"v{nextVer.Major}.{nextVer.Minor}.{nextVer.Build} (Simulação)",
             nextVer,
             "SIMULATED_PREVIEW",
             0,
-            "- Bolinha verde de notificação de atualização no ícone da bandeja\n- Ícone da bandeja Vermelho (microfone ligado) e Azul (desligado)");
+            simNotes,
+            simCount);
         _pendingUpdateRelease = simulated;
-        _rewriteDeck.ShowUpdateAvailable(simulated.TagName, simulated.Notes);
+        _rewriteDeck.ShowUpdateAvailable(simulated.TagName, simulated.Notes, simulated.PendingCount);
         RefreshTrayIconVisual();
-        _statusText.Text = "⬆️ NOVA ATUALIZAÇÃO DISPONÍVEL • CLIQUE NO BANNER VERDE ACIMA PARA ACEITAR";
+        _statusText.Text = $"🔔 {simCount} ATUALIZAÇÃO(ÕES) PENDENTE(S) • CLIQUE NO BANNER VERDE ACIMA PARA ACEITAR";
         try
         {
+            string balloonTitle = simCount == 1
+                ? $"VozWindows — 1 nova atualização ({simulated.TagName})"
+                : $"VozWindows — {simCount} atualizações acumuladas (até {simulated.TagName})";
             _trayIcon?.ShowBalloonTip(
                 4000,
-                $"VozWindows — Nova versão disponível ({simulated.TagName})",
+                balloonTitle,
                 "Clique no botão verde no topo da barra lateral para revisar e aceitar a atualização.",
                 System.Windows.Forms.ToolTipIcon.Info);
         }
@@ -1915,21 +1943,27 @@ public sealed class MainWindow : Window
         var release = await AutoUpdateService.CheckForUpdateAsync();
         if (release != null)
         {
-            bool isNewNotice = _pendingUpdateRelease?.TagName != release.TagName;
+            bool isNewNotice = _pendingUpdateRelease?.TagName != release.TagName ||
+                               _pendingUpdateRelease?.PendingCount != release.PendingCount;
             _pendingUpdateRelease = release;
             _ = Dispatcher.BeginInvoke(() =>
             {
-                _rewriteDeck.ShowUpdateAvailable(release.TagName, release.Notes);
+                _rewriteDeck.ShowUpdateAvailable(release.TagName, release.Notes, release.PendingCount);
                 RefreshTrayIconVisual();
-                _statusText.Text = $"⬆️ ATUALIZAÇÃO {release.TagName} DISPONÍVEL • CLIQUE NO BOTÃO VERDE PARA ACEITAR";
+                _statusText.Text = release.PendingCount == 1
+                    ? $"🔔 1 NOVA ATUALIZAÇÃO ({release.TagName}) • CLIQUE NO BOTÃO VERDE PARA ACEITAR"
+                    : $"🔔 {release.PendingCount} ATUALIZAÇÕES ACUMULADAS (ATÉ {release.TagName}) • CLIQUE NO BOTÃO VERDE";
                 if (isNewNotice)
                 {
                     try
                     {
+                        string balloonTitle = release.PendingCount == 1
+                            ? $"VozWindows — 1 nova atualização ({release.TagName})"
+                            : $"VozWindows — {release.PendingCount} atualizações pendentes (até {release.TagName})";
                         _trayIcon?.ShowBalloonTip(
                             5000,
-                            $"VozWindows — Nova atualização ({release.TagName})",
-                            "Uma nova versão está disponível. Clique no botão verde na barra lateral para aceitar e atualizar.",
+                            balloonTitle,
+                            "Clique no botão verde na barra lateral para revisar as novidades e atualizar de uma só vez.",
                             System.Windows.Forms.ToolTipIcon.Info);
                     }
                     catch { }
@@ -1955,20 +1989,26 @@ public sealed class MainWindow : Window
             ? "• Melhorias gerais de estabilidade e desempenho."
             : release.Notes.Trim();
 
+        int count = Math.Max(1, release.PendingCount);
+        string introHeader = count == 1
+            ? "Há 1 nova versão do VozWindows disponível!"
+            : $"Você possui {count} atualizações acumuladas disponíveis!";
+
         var answer = MessageBox.Show(
             this,
-            $"Uma nova versão do VozWindows está disponível!\n\n" +
+            $"{introHeader}\n\n" +
             $"• Sua versão atual: v{AutoUpdateService.CurrentVersionString}\n" +
-            $"• Nova versão: {release.TagName}\n\n" +
-            $"Novidades:\n{notesBlock}\n\n" +
-            $"Deseja baixar e instalar esta atualização agora?",
+            $"• Atualizações pendentes: {count}\n" +
+            $"• Versão final que será instalada: {release.TagName}\n\n" +
+            $"Novidades acumuladas:\n{notesBlock}\n\n" +
+            $"Deseja baixar a versão {release.TagName} e atualizar tudo agora?",
             "Confirmar Atualização do VozWindows",
             MessageBoxButton.YesNo,
             MessageBoxImage.Information);
 
         if (answer != MessageBoxResult.Yes)
         {
-            _statusText.Text = "ATUALIZAÇÃO ADIADA PELO USUÁRIO • O BOTÃO CONTINUA DISPONÍVEL QUANDO QUISER";
+            _statusText.Text = "ATUALIZAÇÃO ADIADA PELO USUÁRIO • O CONTADOR CONTINUA DISPONÍVEL QUANDO QUISER";
             return;
         }
 
@@ -1977,7 +2017,7 @@ public sealed class MainWindow : Window
             MessageBox.Show(
                 this,
                 "Simulação concluída com sucesso!\n\n" +
-                "Quando você publicar uma versão real (ex: v1.2.0) no GitHub, clicar em 'Sim' fará o download automático do novo VozWindows.exe e reiniciará o aplicativo atualizado.",
+                "Quando você publicar versões reais no GitHub, clicar em 'Sim' baixará direto a versão mais recente (incluindo todas as anteriores acumuladas) e zerará o contador.",
                 "Pré-visualização do Auto-Update",
                 MessageBoxButton.OK,
                 MessageBoxImage.Information);
