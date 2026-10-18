@@ -4,9 +4,10 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
-## [v1.3.0] — 17/10/2026
+## [v1.3.0] — 18/10/2026
 
-- 🔔 **Contador de atualizações acumuladas (1, 2, 3...):** a bolinha verde no ícone perto do relógio e o botão verde na barra lateral agora mostram quantas versões pendentes estão acumuladas.
+- 🔀 **Desacoplamento entre Loop e Velocidade (local):** controles independentes na barra inferior e na bandeja para **Repetição de Borda (`🟢 Loop ON` / `⚪ Loop OFF`)** e **Velocidade do Cursor (`⚡ 1.8x` / `⚡ 2.8x` / `⚡ 4.5x` / `⚪ 1.0x`)**.
+- 🔔 **Contador de atualizações acumuladas (`1`, `2`, `3`...):** a bolinha verde no ícone perto do relógio e o botão verde na barra lateral agora mostram quantas versões pendentes estão acumuladas.
 - 📋 **Resumo consolidado de todas as versões:** ao clicar para atualizar, exibe todas as novidades das versões que você pulou e instala direto a mais recente de uma só vez.
 
 ---

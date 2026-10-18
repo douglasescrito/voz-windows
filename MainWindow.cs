@@ -51,6 +51,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock _livePreviewText;
     private readonly Button _rewriteToggleButton;
     private readonly Button _cursorLoopButton;
+    private readonly Button _cursorSpeedButton;
     private readonly Button _minButton;
     private readonly Rectangle[] _bars = new Rectangle[10];
     private readonly Random _rng = new();
@@ -275,13 +276,21 @@ public sealed class MainWindow : Window
         _rewriteToggleButton.Visibility = Visibility.Collapsed;
 
         _cursorLoopButton = CreateSmallActionButton(
-            _cursorSettings.GetModePillText(),
-            "Alternar modo CursorLoop: 1.8x ➔ 2.8x ➔ 4.5x ➔ OFF (Borda infinita + Touchpad • Atalhos: Ctrl+Alt+1/2/3/0)");
+            _cursorSettings.GetLoopPillText(),
+            "Alternar repetição de borda (Loop ON / OFF) de forma independente da velocidade");
         _cursorLoopButton.Foreground = _cursorSettings.Enabled ? BrushGreenReady : BrushMutedGray;
-        _cursorLoopButton.Click += (_, _) => CycleCursorLoopModeOnBar();
+        _cursorLoopButton.Click += (_, _) => ToggleCursorLoopOnlyOnBar();
+
+        _cursorSpeedButton = CreateSmallActionButton(
+            _cursorSettings.GetSpeedPillText(),
+            "Alternar velocidade do cursor (1.8x ➔ 2.8x ➔ 4.5x ➔ 1.0x) de forma independente do Loop • Atalhos: Ctrl+Alt+1/2/3/0");
+        _cursorSpeedButton.Foreground = _cursorSettings.GetEffectiveMultiplier() > 1.001 ? BrushSkyBlue : BrushMutedGray;
+        _cursorSpeedButton.Click += (_, _) => CycleCursorSpeedOnlyOnBar();
+
         if (!CursorLoopSettings.IsCursorLoopSupported)
         {
             _cursorLoopButton.Visibility = Visibility.Collapsed;
+            _cursorSpeedButton.Visibility = Visibility.Collapsed;
         }
 
         _minButton = CreateSmallActionButton("—", "Minimizar para a bandeja");
@@ -291,6 +300,7 @@ public sealed class MainWindow : Window
         closeButton.Click += (_, _) => MinimizeToTray();
 
         actionsPanel.Children.Add(_cursorLoopButton);
+        actionsPanel.Children.Add(_cursorSpeedButton);
         actionsPanel.Children.Add(closeButton);
 
         Grid.SetColumn(actionsPanel, 2);
@@ -1431,10 +1441,21 @@ public sealed class MainWindow : Window
         RefreshTrayIconVisual();
     }
 
+    public void ToggleCursorLoopOnlyOnBar()
+    {
+        _cursorSettings.ToggleLoopOnBar();
+        ApplyCursorLoopToBar();
+    }
+
+    public void CycleCursorSpeedOnlyOnBar()
+    {
+        _cursorSettings.CycleSpeedOnBar();
+        ApplyCursorLoopToBar();
+    }
+
     public void CycleCursorLoopModeOnBar()
     {
-        _cursorSettings.CycleModeOnBar();
-        ApplyCursorLoopToBar();
+        ToggleCursorLoopOnlyOnBar();
     }
 
     public void SetCursorLoopLevelOnBar(int level)
@@ -1445,19 +1466,25 @@ public sealed class MainWindow : Window
 
     private void ApplyCursorLoopToBar()
     {
-        _cursorEngine.SpeedMultiplier = _cursorSettings.GetEffectiveMultiplier();
+        double mult = _cursorSettings.GetEffectiveMultiplier();
+        bool speedActive = mult > 1.001;
+        _cursorEngine.SpeedMultiplier = mult;
         _cursorEngine.SmartPrecision = _cursorSettings.SmartPrecision;
-        _cursorLoopButton.Content = _cursorSettings.GetModePillText();
+
+        _cursorLoopButton.Content = _cursorSettings.GetLoopPillText();
         _cursorLoopButton.Foreground = _cursorSettings.Enabled
             ? BrushGreenReady
             : new SolidColorBrush(Color.FromRgb(148, 163, 184));
 
+        _cursorSpeedButton.Content = _cursorSettings.GetSpeedPillText();
+        _cursorSpeedButton.Foreground = speedActive
+            ? BrushSkyBlue
+            : new SolidColorBrush(Color.FromRgb(148, 163, 184));
+
         if (!_isListening)
         {
-            _statusDot.Fill = _cursorSettings.Enabled ? BrushGreenReady : BrushAmberWarn;
-            _statusText.Text = _cursorSettings.Enabled
-                ? $"MODO CURSORLOOP HABILITADO ({_cursorSettings.GetEffectiveMultiplier():0.0}x + Borda Infinita) • Clique no botão para alternar"
-                : "MODO CURSORLOOP DESATIVADO (1.0x Padrão) • Clique em ⚪ Loop OFF para reativar";
+            _statusDot.Fill = (_cursorSettings.Enabled || speedActive) ? BrushGreenReady : BrushAmberWarn;
+            _statusText.Text = $"LOOP: {(_cursorSettings.Enabled ? "ATIVO (Borda Infinita)" : "OFF")} • VELOCIDADE: {mult:0.0}x • Controles independentes";
         }
         UpdateTrayTooltip();
     }
@@ -1654,11 +1681,12 @@ public sealed class MainWindow : Window
         if (CursorLoopSettings.IsCursorLoopSupported)
         {
             menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
-            menu.Items.Add("🟢 Alternar Modo CursorLoop na Barra", null, (_, _) => Dispatcher.BeginInvoke(CycleCursorLoopModeOnBar));
-            menu.Items.Add("   • Touchpad Nível 1 (1.8x) [Ctrl+Alt+1]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(1)));
-            menu.Items.Add("   • Touchpad Nível 2 (2.8x) [Ctrl+Alt+2]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(2)));
-            menu.Items.Add("   • Touchpad Nível 3 (4.5x) [Ctrl+Alt+3]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(3)));
-            menu.Items.Add("   • Desativar CursorLoop (OFF) [Ctrl+Alt+0]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(0)));
+            menu.Items.Add("🟢 Alternar Repetição de Borda (Loop ON / OFF)", null, (_, _) => Dispatcher.BeginInvoke(ToggleCursorLoopOnlyOnBar));
+            menu.Items.Add("⚡ Alternar Velocidade do Cursor (Ciclo)", null, (_, _) => Dispatcher.BeginInvoke(CycleCursorSpeedOnlyOnBar));
+            menu.Items.Add("   • Velocidade Nível 1 (1.8x) [Ctrl+Alt+1]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(1)));
+            menu.Items.Add("   • Velocidade Nível 2 (2.8x) [Ctrl+Alt+2]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(2)));
+            menu.Items.Add("   • Velocidade Nível 3 (4.5x) [Ctrl+Alt+3]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(3)));
+            menu.Items.Add("   • Velocidade Padrão (1.0x) [Ctrl+Alt+0]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(0)));
         }
         menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
         menu.Items.Add($"🔄 Verificar Atualização (Atual: v{AutoUpdateService.CurrentVersionString})", null, (_, _) => Dispatcher.BeginInvoke(async () => await CheckForUpdateBackgroundAsync(showUpToDateFeedback: true)));

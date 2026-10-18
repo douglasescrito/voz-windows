@@ -55,9 +55,6 @@ public sealed class CursorLoopSettings
 
     public double GetEffectiveMultiplier()
     {
-        if (!Enabled)
-            return 1.0;
-
         if (UseCustomMultiplier)
             return Math.Clamp(CustomMultiplier, 1.0, 10.0);
 
@@ -70,53 +67,61 @@ public sealed class CursorLoopSettings
         };
     }
 
+    public string GetLoopPillText()
+    {
+        return Enabled ? "🟢 Loop ON" : "⚪ Loop OFF";
+    }
+
+    public string GetSpeedPillText()
+    {
+        double mult = GetEffectiveMultiplier();
+        if (SpeedLevel <= 0 && !UseCustomMultiplier)
+            return "⚪ 1.0x";
+        return $"⚡ {mult.ToString("0.0", CultureInfo.InvariantCulture)}x";
+    }
+
     public string GetModePillText()
     {
-        if (!Enabled)
-            return "⚪ Loop OFF";
+        return $"{GetLoopPillText()} • {GetSpeedPillText()}";
+    }
 
-        double mult = GetEffectiveMultiplier();
-        return $"🟢 Loop {mult.ToString("0.0", CultureInfo.InvariantCulture)}x";
+    /// <summary>
+    /// Alterna exclusivamente a estrutura de repetição de borda (Loop ON/OFF), sem alterar a rotina de velocidade.
+    /// </summary>
+    public void ToggleLoopOnBar()
+    {
+        Enabled = !Enabled;
+        Save();
+    }
+
+    /// <summary>
+    /// Alterna exclusivamente a rotina de velocidade (1.8x -> 2.8x -> 4.5x -> 1.0x), sem alterar o estado do Loop.
+    /// </summary>
+    public void CycleSpeedOnBar()
+    {
+        UseCustomMultiplier = false;
+        SpeedLevel = SpeedLevel switch
+        {
+            0 => 1,
+            1 => 2,
+            2 => 3,
+            _ => 0
+        };
+        Save();
     }
 
     public void CycleModeOnBar()
     {
-        // Cycles: Enabled 1.8x (Level 1) -> Enabled 2.8x (Level 2) -> Enabled 4.5x (Level 3) -> OFF -> Enabled 1.8x
-        UseCustomMultiplier = false;
-        if (!Enabled)
-        {
-            Enabled = true;
-            SpeedLevel = 1;
-        }
-        else if (SpeedLevel == 1)
-        {
-            SpeedLevel = 2;
-        }
-        else if (SpeedLevel == 2)
-        {
-            SpeedLevel = 3;
-        }
-        else
-        {
-            Enabled = false;
-            SpeedLevel = 0;
-        }
-        Save();
+        ToggleLoopOnBar();
     }
 
+    /// <summary>
+    /// Define diretamente o nível de velocidade (0 = 1.0x, 1 = 1.8x, 2 = 2.8x, 3 = 4.5x) de forma independente do Loop.
+    /// </summary>
     public void SetLevelDirect(int level)
     {
         UseCustomMultiplier = false;
-        if (level <= 0)
-        {
-            Enabled = false;
-            SpeedLevel = 0;
-        }
-        else
-        {
-            Enabled = true;
-            SpeedLevel = Math.Clamp(level, 1, 3);
-        }
+        SpeedLevel = Math.Clamp(level, 0, 3);
         Save();
     }
 
@@ -143,8 +148,6 @@ public sealed class CursorLoopSettings
                 var loaded = JsonSerializer.Deserialize<CursorLoopSettings>(json);
                 if (loaded is not null)
                 {
-                    if (loaded.SpeedLevel == 0 && !loaded.UseCustomMultiplier)
-                        loaded.SpeedLevel = 1;
                     return loaded;
                 }
             }
@@ -209,9 +212,12 @@ public sealed class CursorWrapEngine
         _lastRefresh = Environment.TickCount64;
     }
 
-    public void Tick(bool enabled, bool horizontal, bool vertical)
+    public void Tick(bool loopEnabled, bool horizontal, bool vertical)
     {
-        if (!enabled)
+        double multiplier = SpeedMultiplier;
+        bool speedActive = multiplier > 1.001;
+
+        if (!loopEnabled && !speedActive)
         {
             _hasPrevious = false;
             return;
@@ -245,8 +251,7 @@ public sealed class CursorWrapEngine
 
         _lastMoveTick = now;
 
-        double multiplier = SpeedMultiplier;
-        if (multiplier > 1.001 && now - _lastWarp >= 40)
+        if (speedActive && now - _lastWarp >= 40)
         {
             double effectiveMult = multiplier;
             if (SmartPrecision)
@@ -267,18 +272,20 @@ public sealed class CursorWrapEngine
 
             if (boostX != 0 || boostY != 0)
             {
-                Screen? sourceScreen = _screens.FirstOrDefault(s => s.Bounds.Contains(point))
-                                    ?? _screens.FirstOrDefault(s => s.Bounds.Contains(previous));
-
                 int targetX = point.X + boostX;
                 int targetY = point.Y + boostY;
 
-                if (sourceScreen is not null)
+                if (loopEnabled)
                 {
-                    if (horizontal)
-                        targetX = Math.Clamp(targetX, sourceScreen.Bounds.Left, sourceScreen.Bounds.Right - 1);
-                    if (vertical)
-                        targetY = Math.Clamp(targetY, sourceScreen.Bounds.Top, sourceScreen.Bounds.Bottom - 1);
+                    Screen? sourceScreen = _screens.FirstOrDefault(s => s.Bounds.Contains(point))
+                                        ?? _screens.FirstOrDefault(s => s.Bounds.Contains(previous));
+                    if (sourceScreen is not null)
+                    {
+                        if (horizontal)
+                            targetX = Math.Clamp(targetX, sourceScreen.Bounds.Left, sourceScreen.Bounds.Right - 1);
+                        if (vertical)
+                            targetY = Math.Clamp(targetY, sourceScreen.Bounds.Top, sourceScreen.Bounds.Bottom - 1);
+                    }
                 }
 
                 Point boosted = new(targetX, targetY);
@@ -300,7 +307,9 @@ public sealed class CursorWrapEngine
         if (dx != 0) _lastDx = dx;
         if (dy != 0) _lastDy = dy;
         _previous = point;
-        if (now - _lastWarp < 110) return;
+
+        if (!loopEnabled || now - _lastWarp < 110)
+            return;
 
         Screen? current = _screens.FirstOrDefault(s => s.Bounds.Contains(point));
         if (current is null) return;
