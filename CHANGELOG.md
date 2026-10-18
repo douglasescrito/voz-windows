@@ -4,6 +4,13 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.1] — 18/10/2026
+
+- 🔀 **Loop e Velocidade independentes:** separação entre o botão de repetição de borda (Loop ON/OFF) e o seletor de velocidade (1.0x, 1.8x, 2.8x, 4.5x).
+- 📦 **Automação de Release:** incremento automático de versão e publicação contínua a cada modificação.
+
+---
+
 ## [v1.3.0] — 18/10/2026
 
 - 🔀 **Desacoplamento entre Loop e Velocidade (local):** controles independentes na barra inferior e na bandeja para **Repetição de Borda (`🟢 Loop ON` / `⚪ Loop OFF`)** e **Velocidade do Cursor (`⚡ 1.8x` / `⚡ 2.8x` / `⚡ 4.5x` / `⚪ 1.0x`)**.

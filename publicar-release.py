@@ -436,9 +436,23 @@ def sync_git_repository(proj_dir: str, version: str, notes: str) -> None:
     subprocess.run(["git", "push", "origin", tag, "--force"], cwd=proj_dir, check=False)
 
 
+def auto_bump_patch_version(current_version: str) -> str:
+    clean = current_version.lstrip("vV").strip()
+    parts = [int(p) if p.isdigit() else 0 for p in clean.split(".")]
+    while len(parts) < 3:
+        parts.append(0)
+    parts[2] += 1
+    return f"{parts[0]}.{parts[1]}.{parts[2]}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compila e publica uma nova Release do VozWindows no GitHub.")
-    parser.add_argument("--version", help="Define uma nova versao (ex: 1.2.0) no VozWindows.csproj antes de publicar.")
+    parser.add_argument("--version", help="Define uma nova versao (ex: 1.3.1). Se omitido, incrementa o patch automaticamente.")
+    parser.add_argument(
+        "--same-version",
+        action="store_true",
+        help="Mantem a versao atual do VozWindows.csproj sem incrementar automaticamente.",
+    )
     parser.add_argument(
         "--skip-build",
         action="store_true",
@@ -454,8 +468,13 @@ def main() -> int:
     proj_dir = os.path.dirname(os.path.abspath(__file__))
     csproj_path = os.path.join(proj_dir, "VozWindows.csproj")
 
+    current_version = read_csproj_version(csproj_path)
     if args.version:
-        update_csproj_version(csproj_path, args.version)
+        target_version = args.version.lstrip("vV").strip()
+        update_csproj_version(csproj_path, target_version)
+    elif not args.same_version:
+        target_version = auto_bump_patch_version(current_version)
+        update_csproj_version(csproj_path, target_version)
 
     version = read_csproj_version(csproj_path)
     notes = extract_or_update_changelog(proj_dir, version, args.notes)
