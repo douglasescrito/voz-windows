@@ -23,6 +23,7 @@ public sealed class CursorLoopSettings
 {
     public bool Enabled { get; set; } = false;
     public int SpeedLevel { get; set; } = 0; // 0 = 1.0x (OFF), 1 = 1.8x, 2 = 2.8x, 3 = 4.5x
+    public bool RealtimeRewriteEnabled { get; set; } = false; // false = Modo Nativo Puro (sem correção/sem 6 opções)
     public double Level1Multiplier { get; set; } = 1.8;
     public double Level2Multiplier { get; set; } = 2.8;
     public double Level3Multiplier { get; set; } = 4.5;
@@ -80,9 +81,23 @@ public sealed class CursorLoopSettings
         return $"⚡ {mult.ToString("0.0", CultureInfo.InvariantCulture)}x";
     }
 
+    public string GetRewriteModePillText()
+    {
+        return RealtimeRewriteEnabled ? "✨ 6 Opções: ON" : "⚡ Só Nativo";
+    }
+
     public string GetModePillText()
     {
         return $"{GetLoopPillText()} • {GetSpeedPillText()}";
+    }
+
+    /// <summary>
+    /// Alterna entre o Modo Nativo Puro (sem reescrita / sem 6 opções) e o Modo com 6 Opções de Escrita.
+    /// </summary>
+    public void ToggleRealtimeRewriteOnBar()
+    {
+        RealtimeRewriteEnabled = !RealtimeRewriteEnabled;
+        Save();
     }
 
     /// <summary>
@@ -127,6 +142,17 @@ public sealed class CursorLoopSettings
 
     public static CursorLoopSettings Load()
     {
+        CursorLoopSettings? loaded = null;
+        try
+        {
+            if (File.Exists(SettingsPath))
+            {
+                string json = File.ReadAllText(SettingsPath);
+                loaded = JsonSerializer.Deserialize<CursorLoopSettings>(json);
+            }
+        }
+        catch { }
+
         // Em execucao portatil (computadores de terceiros), sempre inicia com o CursorLoop DESATIVADO
         // para nunca interferir no mouse fisico nem teleportar o cursor na borda da tela.
         if (!IsOwnerWorkspaceMachine())
@@ -135,25 +161,17 @@ public sealed class CursorLoopSettings
             {
                 Enabled = false,
                 SpeedLevel = 0,
+                RealtimeRewriteEnabled = loaded?.RealtimeRewriteEnabled ?? false,
                 HorizontalLoop = false,
                 VerticalLoop = false
             };
         }
 
-        try
+        if (loaded is not null)
         {
-            if (File.Exists(SettingsPath))
-            {
-                string json = File.ReadAllText(SettingsPath);
-                var loaded = JsonSerializer.Deserialize<CursorLoopSettings>(json);
-                if (loaded is not null)
-                {
-                    return loaded;
-                }
-            }
+            return loaded;
         }
-        catch { }
-        return new CursorLoopSettings { Enabled = true, SpeedLevel = 1 };
+        return new CursorLoopSettings { Enabled = true, SpeedLevel = 1, RealtimeRewriteEnabled = false };
     }
 
     public void Save()

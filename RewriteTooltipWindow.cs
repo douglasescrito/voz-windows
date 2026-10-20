@@ -8,22 +8,25 @@ using System.Windows.Threading;
 namespace VozWindows;
 
 /// <summary>
-/// Embedded 6-Options Live Deck inside MainWindow._outerBorder.
-/// Tracks conversion state (loading vs. converted ready) with a checkbox, visual highlight,
-/// indeterminate loading bar + spinner, and locks usage while final conversion is in progress.
+/// Embedded Live Deck inside MainWindow._outerBorder.
+/// Supports two instant modes controlled by a user flag:
+/// 1) Modo Nativo Puro (RealtimeRewriteEnabled = false): Zero rewrite CPU/API overhead, direct native dictation.
+/// 2) Modo 6 Opções (RealtimeRewriteEnabled = true): 6 rewrite styles on sentence completion.
 /// </summary>
 public sealed class RewriteDeckView : Border
 {
     private const int OptionCount = 6;
-    private const int PredictionCount = 5;
     public const double NormalSlotWidthDip = 375;
 
+    private readonly TextBlock _slotTitleText;
     private readonly TextBlock _headerStatusText;
-    private readonly ProgressBar _conversionProgressBar;
     private readonly Button _btnUpdateBanner;
+    private readonly Button _btnToggleModeHeader;
     private readonly Button _btnRestorePrevious;
     private readonly Button _btnOriginal;
     private readonly Grid _cardsGrid;
+    private readonly Border _nativeModePanel;
+    private readonly TextBlock _nativeLivePreviewBox;
     private readonly Border[] _cardBorders = new Border[OptionCount];
     private readonly Border[] _cardCheckBorders = new Border[OptionCount];
     private readonly TextBlock[] _cardCheckIcons = new TextBlock[OptionCount];
@@ -31,17 +34,11 @@ public sealed class RewriteDeckView : Border
     private readonly TextBlock[] _cardBodyTexts = new TextBlock[OptionCount];
     private readonly TextBlock[] _cardBadgeTexts = new TextBlock[OptionCount];
 
-    // Next-Word / Phrase Completion Prediction Bar
-    private readonly Border _predictionBoxBorder;
-    private readonly TextBlock _predictionBadgeText;
-    private readonly Border[] _predictionChipBorders = new Border[PredictionCount];
-    private readonly TextBlock[] _predictionChipTexts = new TextBlock[PredictionCount];
-    private readonly string[] _currentPredictions = new string[PredictionCount];
-
     private readonly DispatcherTimer _spinnerTimer;
     private int _spinnerFrameIdx;
     private static readonly string[] SpinnerFrames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 
+    private bool _realtimeRewriteEnabled;
     private bool _hasContent;
     private bool _isConvertedReady;
     private readonly bool[] _cardUsed = new bool[OptionCount];
@@ -56,41 +53,36 @@ public sealed class RewriteDeckView : Border
 
     public double PreferredSlotWidthDip => NormalSlotWidthDip;
 
-    // True Dark Graphite/Obsidian Palette + Conversion Highlight & Loading Palette
-    private static readonly SolidColorBrush BrushCardBg = CreateFrozen(20, 20, 24);              // #141418 (Idle)
-    private static readonly SolidColorBrush BrushCardConvertingBg = CreateFrozen(24, 21, 16);    // #181510 (Converting subtle warm dark)
-    private static readonly SolidColorBrush BrushCardConvertedBg = CreateFrozen(16, 29, 22);     // #101D16 (Converted Ready highlighted emerald dark)
-    private static readonly SolidColorBrush BrushCardUsedBg = CreateFrozen(20, 38, 28);          // #14261C (Applied / Used deeper emerald highlight)
-    private static readonly SolidColorBrush BrushCardHoverBg = CreateFrozen(26, 44, 33);         // #1A2C21 (Hover when Ready)
+    // True Dark Graphite/Obsidian Palette + Conversion Highlight Palette
+    private static readonly SolidColorBrush BrushCardBg = CreateFrozen(20, 20, 24);               // #141418 (Idle)
+    private static readonly SolidColorBrush BrushCardConvertingBg = CreateFrozen(24, 21, 16);     // #181510 (Converting subtle warm dark)
+    private static readonly SolidColorBrush BrushCardConvertedBg = CreateFrozen(16, 29, 22);      // #101D16 (Converted Ready highlighted emerald dark)
+    private static readonly SolidColorBrush BrushCardUsedBg = CreateFrozen(20, 38, 28);           // #14261C (Applied / Used deeper emerald highlight)
+    private static readonly SolidColorBrush BrushCardHoverBg = CreateFrozen(26, 44, 33);          // #1A2C21 (Hover when Ready)
 
-    private static readonly SolidColorBrush BrushCardBorder = CreateFrozen(40, 40, 46);          // #28282E (Idle border)
+    private static readonly SolidColorBrush BrushCardBorder = CreateFrozen(40, 40, 46);           // #28282E (Idle border)
     private static readonly SolidColorBrush BrushCardConvertingBorder = CreateFrozen(146, 64, 14);// #92400E (Amber loading border)
-    private static readonly SolidColorBrush BrushCardConvertedBorder = CreateFrozen(22, 163, 74);// #16A34A (Converted Ready green highlight border)
-    private static readonly SolidColorBrush BrushCardUsedBorder = CreateFrozen(34, 197, 94);     // #22C55E (Bright green used border)
-    private static readonly SolidColorBrush BrushCardHoverBorder = CreateFrozen(74, 222, 128);   // #4ADE80 (Hover green border)
+    private static readonly SolidColorBrush BrushCardConvertedBorder = CreateFrozen(22, 163, 74); // #16A34A (Converted Ready green highlight border)
+    private static readonly SolidColorBrush BrushCardUsedBorder = CreateFrozen(34, 197, 94);      // #22C55E (Bright green used border)
+    private static readonly SolidColorBrush BrushCardHoverBorder = CreateFrozen(74, 222, 128);    // #4ADE80 (Hover green border)
 
-    private static readonly SolidColorBrush BrushCheckIdleBg = CreateFrozen(28, 28, 34);         // #1C1C22
-    private static readonly SolidColorBrush BrushCheckIdleBorder = CreateFrozen(82, 82, 91);     // #52525B
-    private static readonly SolidColorBrush BrushCheckConvertingBg = CreateFrozen(69, 26, 3);    // #451A03
-    private static readonly SolidColorBrush BrushCheckConvertedBg = CreateFrozen(22, 163, 74);   // #16A34A
+    private static readonly SolidColorBrush BrushCheckIdleBg = CreateFrozen(28, 28, 34);          // #1C1C22
+    private static readonly SolidColorBrush BrushCheckIdleBorder = CreateFrozen(82, 82, 91);      // #52525B
+    private static readonly SolidColorBrush BrushCheckConvertingBg = CreateFrozen(69, 26, 3);     // #451A03
+    private static readonly SolidColorBrush BrushCheckConvertedBg = CreateFrozen(22, 163, 74);    // #16A34A
 
-    // Next-Word Prediction Bar Palette
-    private static readonly SolidColorBrush BrushPredictBoxBg = CreateFrozen(16, 18, 24);        // #101218
-    private static readonly SolidColorBrush BrushPredictBoxBorder = CreateFrozen(45, 55, 72);    // #2D3748
-    private static readonly SolidColorBrush BrushChipBg = CreateFrozen(26, 30, 40);              // #1A1E28
-    private static readonly SolidColorBrush BrushChipHoverBg = CreateFrozen(22, 101, 52);        // #166534
-    private static readonly SolidColorBrush BrushChipBorder = CreateFrozen(63, 75, 98);          // #3F4B62
-    private static readonly SolidColorBrush BrushChipAiBorder = CreateFrozen(56, 189, 248);      // #38BDF8
-    private static readonly SolidColorBrush BrushSkyAccent = CreateFrozen(56, 189, 248);         // #38BDF8
+    private static readonly SolidColorBrush BrushNativePanelBg = CreateFrozen(15, 20, 28);        // #0F141C
+    private static readonly SolidColorBrush BrushNativePanelBorder = CreateFrozen(37, 99, 235);   // #2563EB
+    private static readonly SolidColorBrush BrushSkyAccent = CreateFrozen(56, 189, 248);          // #38BDF8
 
-    private static readonly SolidColorBrush BrushDivider = CreateFrozen(36, 36, 42);             // #24242A
-    private static readonly SolidColorBrush BrushAccentSilver = CreateFrozen(212, 212, 216);     // #D4D4D8
-    private static readonly SolidColorBrush BrushAccentGreen = CreateFrozen(34, 197, 94);        // #22C55E
-    private static readonly SolidColorBrush BrushAccentBrightGreen = CreateFrozen(74, 222, 128); // #4ADE80
-    private static readonly SolidColorBrush BrushAmberLoading = CreateFrozen(245, 158, 11);      // #F59E0B
-    private static readonly SolidColorBrush BrushMutedText = CreateFrozen(161, 161, 170);        // #A1A1AA
-    private static readonly SolidColorBrush BrushDimConvertingText = CreateFrozen(185, 185, 195);// #B9B9C3
-    private static readonly SolidColorBrush BrushBrightText = CreateFrozen(244, 244, 245);       // #F4F4F5
+    private static readonly SolidColorBrush BrushDivider = CreateFrozen(36, 36, 42);              // #24242A
+    private static readonly SolidColorBrush BrushAccentSilver = CreateFrozen(212, 212, 216);      // #D4D4D8
+    private static readonly SolidColorBrush BrushAccentGreen = CreateFrozen(34, 197, 94);         // #22C55E
+    private static readonly SolidColorBrush BrushAccentBrightGreen = CreateFrozen(74, 222, 128);  // #4ADE80
+    private static readonly SolidColorBrush BrushAmberLoading = CreateFrozen(245, 158, 11);       // #F59E0B
+    private static readonly SolidColorBrush BrushMutedText = CreateFrozen(161, 161, 170);         // #A1A1AA
+    private static readonly SolidColorBrush BrushDimConvertingText = CreateFrozen(185, 185, 195); // #B9B9C3
+    private static readonly SolidColorBrush BrushBrightText = CreateFrozen(244, 244, 245);        // #F4F4F5
 
     private static readonly string[] OptionLabels =
     {
@@ -98,11 +90,11 @@ public sealed class RewriteDeckView : Border
     };
 
     public event Action<string, string>? OnOptionClicked;
-    public event Action<string>? OnPredictionChipClicked;
     public event Action? OnRestorePreviousRequested;
     public event Action? OnResetBlockRequested;
     public event Action? OnUserDisabled;
     public event Action? OnUpdateRequested;
+    public event Action? OnToggleRewriteModeRequested;
 
     private static SolidColorBrush CreateFrozen(byte r, byte g, byte b)
     {
@@ -122,9 +114,8 @@ public sealed class RewriteDeckView : Border
         var rootGrid = new Grid { ClipToBounds = true };
         rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         rootGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        rootGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-        // Header block (Title + Action Buttons + Auto-Update Banner + Loading Progress Bar)
+        // Header block (Title + Action Buttons + Auto-Update Banner)
         var headerStack = new StackPanel
         {
             Margin = new Thickness(2, 0, 2, 6)
@@ -134,17 +125,17 @@ public sealed class RewriteDeckView : Border
         topHeaderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         topHeaderRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-        var slotTitle = new TextBlock
+        _slotTitleText = new TextBlock
         {
-            Text = $"✨ 6 OPÇÕES AO VIVO • v{AutoUpdateService.CurrentVersionString}",
+            Text = $"⚡ VOZ NATIVA • v{AutoUpdateService.CurrentVersionString}",
             FontSize = 11.5,
             FontWeight = FontWeights.Bold,
             Foreground = BrushBrightText,
             VerticalAlignment = VerticalAlignment.Center,
             TextTrimming = TextTrimming.CharacterEllipsis
         };
-        Grid.SetColumn(slotTitle, 0);
-        topHeaderRow.Children.Add(slotTitle);
+        Grid.SetColumn(_slotTitleText, 0);
+        topHeaderRow.Children.Add(_slotTitleText);
 
         _btnUpdateBanner = CreateHeaderButton(
             "⬆️ Nova atualização disponível — Clique para atualizar",
@@ -163,25 +154,23 @@ public sealed class RewriteDeckView : Border
 
         _headerStatusText = new TextBlock
         {
-            Text = "Fale para converter • O checkbox ☑ libera o clique após concluir a correção",
+            Text = "⚡ Modo Nativo Direto ativo • Sem processamento de reescrita",
             FontSize = 10.5,
             FontWeight = FontWeights.SemiBold,
-            Foreground = BrushMutedText,
+            Foreground = BrushSkyAccent,
             TextTrimming = TextTrimming.CharacterEllipsis
         };
 
-        _conversionProgressBar = new ProgressBar
-        {
-            Height = 3.5,
-            IsIndeterminate = true,
-            Foreground = BrushAmberLoading,
-            Background = BrushCardBg,
-            BorderThickness = new Thickness(0),
-            Margin = new Thickness(0, 4, 0, 1),
-            Visibility = Visibility.Collapsed
-        };
-
         var headerBtns = new StackPanel { Orientation = Orientation.Horizontal };
+
+        _btnToggleModeHeader = CreateHeaderButton(
+            "⚡ Só Nativo",
+            "Alternar entre Modo Nativo Direto (sem correção/sem 6 opções, máxima velocidade) e Modo 6 Opções de Escrita");
+        _btnToggleModeHeader.Foreground = BrushSkyAccent;
+        _btnToggleModeHeader.Click += (_, _) =>
+        {
+            OnToggleRewriteModeRequested?.Invoke();
+        };
 
         _btnRestorePrevious = CreateHeaderButton("⏪ Anterior", "Recuperar a conversa anterior que foi limpa automaticamente após o uso");
         _btnRestorePrevious.Foreground = BrushSkyAccent;
@@ -215,7 +204,9 @@ public sealed class RewriteDeckView : Border
         btnReset.Click += (_, _) =>
         {
             OnResetBlockRequested?.Invoke();
-            _headerStatusText.Text = "✨ BLOCO ZERADO • Fale a nova mensagem para gerar as 6 variações";
+            _headerStatusText.Text = _realtimeRewriteEnabled
+                ? "✨ BLOCO ZERADO • Fale a nova mensagem para gerar as 6 variações"
+                : "⚡ BLOCO ZERADO • Modo Nativo Direto pronto para nova fala";
             _headerStatusText.Foreground = BrushAccentSilver;
         };
 
@@ -225,6 +216,7 @@ public sealed class RewriteDeckView : Border
             OnUserDisabled?.Invoke();
         };
 
+        headerBtns.Children.Add(_btnToggleModeHeader);
         headerBtns.Children.Add(_btnRestorePrevious);
         headerBtns.Children.Add(_btnOriginal);
         headerBtns.Children.Add(btnReset);
@@ -235,15 +227,85 @@ public sealed class RewriteDeckView : Border
         headerStack.Children.Add(topHeaderRow);
         headerStack.Children.Add(_btnUpdateBanner);
         headerStack.Children.Add(_headerStatusText);
-        headerStack.Children.Add(_conversionProgressBar);
         Grid.SetRow(headerStack, 0);
         rootGrid.Children.Add(headerStack);
 
-        // Fixed 6-Row Proportional Grid: all 6 boxes permanently stay in the exact same area!
+        // Panel 1: Native Direct Mode View (shown when RealtimeRewriteEnabled == false)
+        _nativeModePanel = new Border
+        {
+            CornerRadius = new CornerRadius(10),
+            Background = BrushNativePanelBg,
+            BorderBrush = BrushNativePanelBorder,
+            BorderThickness = new Thickness(1.2),
+            Padding = new Thickness(14, 14, 14, 14),
+            Margin = new Thickness(0, 2, 2, 0),
+            VerticalAlignment = VerticalAlignment.Top
+        };
+
+        var nativeStack = new StackPanel();
+        var nativeBadge = new TextBlock
+        {
+            Text = "⚡ MODO NATIVO DIRETO (ALTA PERFORMANCE)",
+            FontSize = 11.5,
+            FontWeight = FontWeights.Bold,
+            Foreground = BrushSkyAccent,
+            Margin = new Thickness(0, 0, 0, 6)
+        };
+        var nativeDesc = new TextBlock
+        {
+            Text = "As palavras são digitadas diretamente no cursor assim que você fala, sem gastar processamento com correções ou geração das 6 opções de escrita.",
+            FontSize = 11.5,
+            Foreground = BrushMutedText,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 10)
+        };
+
+        var previewCard = new Border
+        {
+            CornerRadius = new CornerRadius(7),
+            Background = BrushCardBg,
+            BorderBrush = BrushCardBorder,
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(10, 8, 10, 8),
+            Margin = new Thickness(0, 0, 0, 10)
+        };
+        _nativeLivePreviewBox = new TextBlock
+        {
+            Text = "Fale normalmente (F8) para digitar direto no cursor...",
+            FontSize = 12.5,
+            FontWeight = FontWeights.Medium,
+            Foreground = BrushBrightText,
+            TextWrapping = TextWrapping.Wrap,
+            MaxHeight = 260,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        previewCard.Child = _nativeLivePreviewBox;
+
+        var btnEnableSixOptions = CreateHeaderButton(
+            "✨ Ativar 6 Opções de Escrita (IA)",
+            "Habilitar novamente o painel com as 6 variações de reescrita quando precisar");
+        btnEnableSixOptions.Background = CreateFrozen(28, 36, 52);
+        btnEnableSixOptions.Foreground = BrushBrightText;
+        btnEnableSixOptions.Padding = new Thickness(12, 7, 12, 7);
+        btnEnableSixOptions.Margin = new Thickness(0);
+        btnEnableSixOptions.HorizontalAlignment = HorizontalAlignment.Left;
+        btnEnableSixOptions.Click += (_, _) =>
+        {
+            OnToggleRewriteModeRequested?.Invoke();
+        };
+
+        nativeStack.Children.Add(nativeBadge);
+        nativeStack.Children.Add(nativeDesc);
+        nativeStack.Children.Add(previewCard);
+        nativeStack.Children.Add(btnEnableSixOptions);
+        _nativeModePanel.Child = nativeStack;
+
+        // Panel 2: Fixed 6-Row Proportional Grid (shown when RealtimeRewriteEnabled == true)
         _cardsGrid = new Grid
         {
             ClipToBounds = true,
-            Margin = new Thickness(0, 0, 2, 0)
+            Margin = new Thickness(0, 0, 2, 0),
+            Visibility = Visibility.Collapsed
         };
         for (int r = 0; r < OptionCount; r++)
         {
@@ -286,7 +348,6 @@ public sealed class RewriteDeckView : Border
             topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             topRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-            // Visual Checkbox / Loading Spinner Box
             var checkBorder = new Border
             {
                 Width = 16,
@@ -372,7 +433,6 @@ public sealed class RewriteDeckView : Border
                 if (!_hasContent || string.IsNullOrWhiteSpace(_optionTexts[idx]))
                     return;
 
-                // Block usage while still converting to final version!
                 if (!_isConvertedReady)
                 {
                     _headerStatusText.Text = "⏳ CONVERSÃO EM ANDAMENTO • Aguarde o checkbox ☑ ficar verde para usar";
@@ -402,126 +462,19 @@ public sealed class RewriteDeckView : Border
             _cardsGrid.Children.Add(card);
         }
 
+        Grid.SetRow(_nativeModePanel, 1);
         Grid.SetRow(_cardsGrid, 1);
+        rootGrid.Children.Add(_nativeModePanel);
         rootGrid.Children.Add(_cardsGrid);
 
-        // Row 2: Next-Word / Phrase Completion Prediction Bar (5 clickable chips)
-        _predictionBoxBorder = new Border
+        // Low-overhead background spinner (250ms at Background priority, only when 6 options mode is active)
+        _spinnerTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
-            CornerRadius = new CornerRadius(8),
-            Background = BrushPredictBoxBg,
-            BorderBrush = BrushPredictBoxBorder,
-            BorderThickness = new Thickness(1.2),
-            Padding = new Thickness(8, 6, 8, 6),
-            Margin = new Thickness(0, 6, 2, 0),
-            ClipToBounds = true
-        };
-
-        var predStack = new StackPanel();
-        var predHeaderGrid = new Grid { Margin = new Thickness(0, 0, 0, 5) };
-        predHeaderGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        predHeaderGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-        var predTitle = new TextBlock
-        {
-            Text = "🔮 PRÓXIMA PALAVRA • COMPLETAR FALA",
-            FontSize = 10,
-            FontWeight = FontWeights.Bold,
-            Foreground = BrushSkyAccent,
-            VerticalAlignment = VerticalAlignment.Center,
-            TextTrimming = TextTrimming.CharacterEllipsis
-        };
-        Grid.SetColumn(predTitle, 0);
-        predHeaderGrid.Children.Add(predTitle);
-
-        _predictionBadgeText = new TextBlock
-        {
-            Text = "Clique para inserir no cursor",
-            FontSize = 9.5,
-            FontWeight = FontWeights.SemiBold,
-            Foreground = BrushMutedText,
-            VerticalAlignment = VerticalAlignment.Center
-        };
-        Grid.SetColumn(_predictionBadgeText, 1);
-        predHeaderGrid.Children.Add(_predictionBadgeText);
-
-        var chipsWrap = new WrapPanel
-        {
-            Orientation = Orientation.Horizontal
-        };
-
-        string[] initialPredictions = GeminiRewriteClient.PredictNextWordsLocally(string.Empty);
-        for (int p = 0; p < PredictionCount; p++)
-        {
-            int pIdx = p;
-            string initialWord = p < initialPredictions.Length ? initialPredictions[p] : "continuar";
-            _currentPredictions[p] = initialWord;
-
-            var chipBorder = new Border
-            {
-                CornerRadius = new CornerRadius(6),
-                Background = BrushChipBg,
-                BorderBrush = BrushChipBorder,
-                BorderThickness = new Thickness(1),
-                Padding = new Thickness(8, 4, 8, 4),
-                Margin = new Thickness(0, 0, 5, 4),
-                Cursor = Cursors.Hand,
-                Focusable = false,
-                ToolTip = "Clique para acrescentar esta sugestão ao final do que você está falando no cursor"
-            };
-
-            var chipText = new TextBlock
-            {
-                Text = "+ " + initialWord,
-                FontSize = 11,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = BrushBrightText,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                MaxWidth = 158
-            };
-            chipBorder.Child = chipText;
-
-            chipBorder.MouseEnter += (_, _) =>
-            {
-                chipBorder.Background = BrushChipHoverBg;
-                chipBorder.BorderBrush = BrushAccentBrightGreen;
-            };
-            chipBorder.MouseLeave += (_, _) =>
-            {
-                chipBorder.Background = BrushChipBg;
-                chipBorder.BorderBrush = _isConvertedReady ? BrushChipAiBorder : BrushChipBorder;
-            };
-            chipBorder.PreviewMouseLeftButtonDown += (_, e) =>
-            {
-                e.Handled = true;
-                string wordToAppend = _currentPredictions[pIdx];
-                if (!string.IsNullOrWhiteSpace(wordToAppend))
-                {
-                    _predictionBadgeText.Text = $"✓ Inserido: \"{wordToAppend}\"";
-                    _predictionBadgeText.Foreground = BrushAccentBrightGreen;
-                    OnPredictionChipClicked?.Invoke(wordToAppend);
-                }
-            };
-
-            _predictionChipBorders[p] = chipBorder;
-            _predictionChipTexts[p] = chipText;
-            chipsWrap.Children.Add(chipBorder);
-        }
-
-        predStack.Children.Add(predHeaderGrid);
-        predStack.Children.Add(chipsWrap);
-        _predictionBoxBorder.Child = predStack;
-
-        Grid.SetRow(_predictionBoxBorder, 2);
-        rootGrid.Children.Add(_predictionBoxBorder);
-
-        _spinnerTimer = new DispatcherTimer(DispatcherPriority.Render)
-        {
-            Interval = TimeSpan.FromMilliseconds(85)
+            Interval = TimeSpan.FromMilliseconds(250)
         };
         _spinnerTimer.Tick += (_, _) =>
         {
-            if (!_hasContent || _isConvertedReady)
+            if (!_realtimeRewriteEnabled || !_hasContent || _isConvertedReady)
             {
                 _spinnerTimer.Stop();
                 return;
@@ -539,68 +492,81 @@ public sealed class RewriteDeckView : Border
         Child = rootGrid;
     }
 
-    /// <summary>
-    /// Immediately engages the converting/loading indicator and locks card clicks as soon as speech starts,
-    /// while also updating the 0ms next-word completion chips in real time.
-    /// </summary>
+    public void SetRealtimeRewriteMode(bool enabled)
+    {
+        _realtimeRewriteEnabled = enabled;
+        if (!enabled)
+        {
+            _spinnerTimer.Stop();
+            _cardsGrid.Visibility = Visibility.Collapsed;
+            _nativeModePanel.Visibility = Visibility.Visible;
+            _btnOriginal.Visibility = Visibility.Collapsed;
+            _btnRestorePrevious.Visibility = Visibility.Collapsed;
+
+            _slotTitleText.Text = $"⚡ VOZ NATIVA • v{AutoUpdateService.CurrentVersionString}";
+            _btnToggleModeHeader.Content = "⚡ Só Nativo";
+            _btnToggleModeHeader.Foreground = BrushSkyAccent;
+            _headerStatusText.Text = "⚡ Modo Nativo Direto ativo • Sem reescrita e sem 6 opções (máxima velocidade)";
+            _headerStatusText.Foreground = BrushSkyAccent;
+        }
+        else
+        {
+            _nativeModePanel.Visibility = Visibility.Collapsed;
+            _cardsGrid.Visibility = Visibility.Visible;
+            _btnOriginal.Visibility = Visibility.Visible;
+
+            _slotTitleText.Text = $"✨ 6 OPÇÕES AO VIVO • v{AutoUpdateService.CurrentVersionString}";
+            _btnToggleModeHeader.Content = "✨ 6 Opções: ON";
+            _btnToggleModeHeader.Foreground = BrushAccentBrightGreen;
+            _headerStatusText.Text = _hasContent
+                ? "☑ 6 opções ativas • Clique em qualquer opção para aplicar no cursor"
+                : "Fale para converter • O checkbox ☑ libera o clique após concluir a correção";
+            _headerStatusText.Foreground = _hasContent ? BrushAccentBrightGreen : BrushMutedText;
+            RefreshAllCardsVisualState();
+        }
+    }
+
+    public void UpdateNativeLivePreview(string text, bool isFinal)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            _nativeLivePreviewBox.Text = "Fale normalmente (F8) para digitar direto no cursor...";
+            _nativeLivePreviewBox.Foreground = BrushMutedText;
+            return;
+        }
+
+        string tail = FormatRollingTailForCard(text, 280);
+        _nativeLivePreviewBox.Text = (isFinal ? "✓ " : "🗣️ ") + tail;
+        _nativeLivePreviewBox.Foreground = isFinal ? BrushBrightText : BrushSkyAccent;
+    }
+
     public void SetConvertingLiveState(int currentCharCount = 0, string? activeSpokenText = null)
     {
+        if (!_realtimeRewriteEnabled)
+        {
+            if (!string.IsNullOrWhiteSpace(activeSpokenText))
+            {
+                UpdateNativeLivePreview(activeSpokenText, isFinal: false);
+            }
+            return;
+        }
+
         _hasContent = true;
         _isConvertedReady = false;
-        _conversionProgressBar.Visibility = Visibility.Visible;
 
         if (!_spinnerTimer.IsEnabled)
         {
             _spinnerTimer.Start();
         }
 
-        if (!string.IsNullOrWhiteSpace(activeSpokenText))
-        {
-            UpdatePredictionsDisplay(GeminiRewriteClient.PredictNextWordsLocally(activeSpokenText), isAiContextual: false);
-        }
-
         _headerStatusText.Text = currentCharCount > 0
-            ? $"⏳ CONVERTENDO PARA VERSÃO FINAL ({currentCharCount} chars)... Aguarde concluir"
-            : "⏳ CONVERTENDO PARA VERSÃO FINAL... Aguarde concluir para liberar o clique";
+            ? $"⏳ FALE À VONTADE ({currentCharCount} chars)... As 6 opções serão convertidas ao concluir"
+            : "⏳ FALE À VONTADE... As 6 opções serão convertidas ao concluir";
         _headerStatusText.Foreground = BrushAmberLoading;
-
-        RefreshAllCardsVisualState();
-    }
-
-    private void UpdatePredictionsDisplay(string[]? suggestions, bool isAiContextual)
-    {
-        string[] effective = (suggestions != null && suggestions.Length > 0)
-            ? suggestions
-            : GeminiRewriteClient.PredictNextWordsLocally(_rawOriginal);
-
-        for (int p = 0; p < PredictionCount; p++)
-        {
-            string word = p < effective.Length ? effective[p] : "...";
-            _currentPredictions[p] = word;
-            _predictionChipTexts[p].Text = "+ " + word;
-            _predictionChipBorders[p].BorderBrush = isAiContextual ? BrushChipAiBorder : BrushChipBorder;
-        }
-
-        if (!_hasContent)
-        {
-            _predictionBadgeText.Text = "Clique para inserir no cursor";
-            _predictionBadgeText.Foreground = BrushMutedText;
-        }
-        else if (isAiContextual)
-        {
-            _predictionBadgeText.Text = "✨ IA Contextual • Clique p/ completar";
-            _predictionBadgeText.Foreground = BrushSkyAccent;
-        }
-        else
-        {
-            _predictionBadgeText.Text = "⚡ Ao vivo • Clique p/ completar";
-            _predictionBadgeText.Foreground = BrushAmberLoading;
-        }
     }
 
     public void UpdateVariations(RewriteVariations v)
     {
-        // Store 100% of the complete text in memory so clicking any card pastes the ENTIRE speech
         _rawOriginal = v.RawOriginal;
         _optionTexts[0] = v.DiretaCoesa;
         _optionTexts[1] = v.FormalPolida;
@@ -612,34 +578,35 @@ public sealed class RewriteDeckView : Border
         _hasContent = !string.IsNullOrWhiteSpace(v.RawOriginal);
         _isConvertedReady = _hasContent && v.IsAiRefined;
 
+        if (!_realtimeRewriteEnabled)
+        {
+            UpdateNativeLivePreview(_rawOriginal, isFinal: true);
+            return;
+        }
+
         for (int i = 0; i < OptionCount; i++)
         {
             _cardBodyTexts[i].Text = FormatRollingTailForCard(_optionTexts[i], maxVisibleChars: 175);
         }
 
-        UpdatePredictionsDisplay(v.SugestoesCompletar, isAiContextual: _isConvertedReady);
-
         if (!_hasContent)
         {
             _spinnerTimer.Stop();
-            _conversionProgressBar.Visibility = Visibility.Collapsed;
             _headerStatusText.Text = "Fale para converter • O checkbox ☑ libera o clique após concluir a correção";
             _headerStatusText.Foreground = BrushMutedText;
         }
         else if (!_isConvertedReady)
         {
-            _conversionProgressBar.Visibility = Visibility.Visible;
             if (!_spinnerTimer.IsEnabled)
             {
                 _spinnerTimer.Start();
             }
-            _headerStatusText.Text = $"⏳ CONVERTENDO AO VIVO ({v.RawOriginal.Length} chars)... Bloqueado até concluir a correção";
+            _headerStatusText.Text = $"⏳ CONVERTENDO ({v.RawOriginal.Length} chars)... Aguarde concluir";
             _headerStatusText.Foreground = BrushAmberLoading;
         }
         else
         {
             _spinnerTimer.Stop();
-            _conversionProgressBar.Visibility = Visibility.Collapsed;
             _headerStatusText.Text = $"☑ 6 OPÇÕES CONVERTIDAS E LIBERADAS ({v.RawOriginal.Length} chars) • Clique para usar";
             _headerStatusText.Foreground = BrushAccentBrightGreen;
         }
@@ -649,6 +616,9 @@ public sealed class RewriteDeckView : Border
 
     private void RefreshAllCardsVisualState()
     {
+        if (!_realtimeRewriteEnabled)
+            return;
+
         for (int i = 0; i < OptionCount; i++)
         {
             RefreshSingleCardVisualState(i);
@@ -698,7 +668,6 @@ public sealed class RewriteDeckView : Border
             return;
         }
 
-        // Converted & Ready! Show Checkbox ☑ + Highlighted Visual State
         bool isUsed = _cardUsed[i];
         bool isLastApplied = (_lastAppliedIndex == i);
 
@@ -733,10 +702,6 @@ public sealed class RewriteDeckView : Border
         }
     }
 
-    /// <summary>
-    /// Displays "..." for the portion of the text that already passed while keeping the active live tail
-    /// visible inside the fixed card box. The complete text remains 100% intact in _optionTexts[i].
-    /// </summary>
     public static string FormatRollingTailForCard(string fullText, int maxVisibleChars = 175)
     {
         if (string.IsNullOrWhiteSpace(fullText))
@@ -758,7 +723,7 @@ public sealed class RewriteDeckView : Border
 
     public void SetPreviousBackupAvailable(bool available)
     {
-        _btnRestorePrevious.Visibility = available ? Visibility.Visible : Visibility.Collapsed;
+        _btnRestorePrevious.Visibility = (_realtimeRewriteEnabled && available) ? Visibility.Visible : Visibility.Collapsed;
     }
 
     public void ShowUpdateAvailable(string tagName, string? releaseNotes = null, int pendingCount = 1)
@@ -802,21 +767,22 @@ public sealed class RewriteDeckView : Border
         }
         else
         {
-            _headerStatusText.Text = hasBackup
-                ? "✨ AUTO-LIMPO • Pronto p/ nova fala (ou clique em ⏪ Anterior)"
-                : "✨ AUTO-LIMPO • Pronto para a próxima conversa";
+            _headerStatusText.Text = _realtimeRewriteEnabled
+                ? (hasBackup ? "✨ AUTO-LIMPO • Pronto p/ nova fala (ou clique em ⏪ Anterior)" : "✨ AUTO-LIMPO • Pronto para a próxima conversa")
+                : "⚡ MODO NATIVO DIRETO • Pronto para a próxima fala";
         }
-        _headerStatusText.Foreground = BrushAccentBrightGreen;
+        _headerStatusText.Foreground = _realtimeRewriteEnabled ? BrushAccentBrightGreen : BrushSkyAccent;
     }
 
     public void ResetDisplay()
     {
         _spinnerTimer.Stop();
-        _conversionProgressBar.Visibility = Visibility.Collapsed;
         _rawOriginal = string.Empty;
         _hasContent = false;
         _isConvertedReady = false;
         _lastAppliedIndex = -1;
+        _nativeLivePreviewBox.Text = "Fale normalmente (F8) para digitar direto no cursor...";
+        _nativeLivePreviewBox.Foreground = BrushMutedText;
 
         for (int i = 0; i < OptionCount; i++)
         {
@@ -825,7 +791,6 @@ public sealed class RewriteDeckView : Border
             _cardBodyTexts[i].Text = "Fale normalmente para ver esta opção atualizar ao vivo...";
         }
 
-        UpdatePredictionsDisplay(GeminiRewriteClient.PredictNextWordsLocally(string.Empty), isAiContextual: false);
         RefreshAllCardsVisualState();
     }
 

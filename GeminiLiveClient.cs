@@ -96,19 +96,11 @@ public sealed class GeminiLiveClient : IAsyncDisposable
     }
 
     /// <summary>
-    ///Hard cut-off of the current speech turn: marks any open server turn prefix as consumed
-    ///and rotates the WebSocket in the background so the next conversation starts 100% fresh.
+    /// Marks any open server turn prefix as consumed without dropping queued audio or resetting the WebSocket.
     /// </summary>
     public void CutOffServerTurn()
     {
         ClearInterimState();
-        while (_pcmQueue.TryDequeue(out _)) { }
-
-        var conn = _activeConn;
-        if (conn != null && conn.HasTranscribedInSession && !_hotSwapping && !_reconnecting)
-        {
-            _ = PerformZeroDowntimeHotSwapAsync(forceForCleanTurn: true);
-        }
     }
 
     public async Task StartSessionAsync(string apiKey, string languageCode = "pt-BR")
@@ -394,9 +386,8 @@ public sealed class GeminiLiveClient : IAsyncDisposable
                 string json = "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"" + b64 + "\"}}}";
                 byte[] utf8 = Encoding.UTF8.GetBytes(json);
 
-                using var sendTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(2200));
-                using var linked = CancellationTokenSource.CreateLinkedTokenSource(conn.Cts.Token, sendTimeout.Token);
-                await conn.Socket.SendAsync(new ArraySegment<byte>(utf8), WebSocketMessageType.Text, true, linked.Token);
+                await conn.Socket.SendAsync(new ArraySegment<byte>(utf8), WebSocketMessageType.Text, true, conn.Cts.Token)
+                    .WaitAsync(TimeSpan.FromMilliseconds(2200), conn.Cts.Token);
                 _lastSendSuccessUtc = DateTime.UtcNow;
             }
         }

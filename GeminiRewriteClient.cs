@@ -20,8 +20,7 @@ public sealed record RewriteVariations(
     string EmpaticaCordial,
     string ExplicativaClara,
     string PersuasivaConfiante,
-    bool IsAiRefined,
-    string[]? SugestoesCompletar = null);
+    bool IsAiRefined);
 
 public sealed class GeminiRewriteClient : IDisposable
 {
@@ -33,10 +32,10 @@ public sealed class GeminiRewriteClient : IDisposable
         KeepAlivePingDelay = TimeSpan.FromSeconds(15),
         KeepAlivePingTimeout = TimeSpan.FromSeconds(8),
         EnableMultipleHttp2Connections = true,
-        ConnectTimeout = TimeSpan.FromSeconds(3.5)
+        ConnectTimeout = TimeSpan.FromSeconds(2.5)
     })
     {
-        Timeout = TimeSpan.FromSeconds(12)
+        Timeout = TimeSpan.FromSeconds(8)
     };
 
     // Circuit breaker cooldown map so rate-limited (429) or overloaded (503/timeout) models are skipped in 0ms
@@ -45,7 +44,7 @@ public sealed class GeminiRewriteClient : IDisposable
     private CancellationTokenSource? _pendingCts;
     private long _versionCounter;
 
-    // High-capacity memory cache for long speeches so prefix paragraphs stay AI-refined and never re-run regexes on every syllable
+    // High-capacity memory cache for long speeches so prefix paragraphs stay AI-refined
     private readonly object _prefixLock = new();
     private string _cachedRawPrefix = string.Empty;
     private RewriteVariations? _cachedPrefixVariations;
@@ -53,11 +52,6 @@ public sealed class GeminiRewriteClient : IDisposable
     // Cache of the last AI-refined active tail so duplicate requests return in 0ms without hitting the network
     private string _lastRefinedTailRaw = string.Empty;
     private RewriteVariations? _lastRefinedTailResult;
-
-    // User vocabulary Bigram/Trigram memory for 0ms personalized next-word predictions
-    private static readonly object BigramLock = new();
-    private static readonly Dictionary<string, List<string>> LearnedNextWords =
-        new(StringComparer.OrdinalIgnoreCase);
 
     public event Action<RewriteVariations>? OnVariationsUpdated;
 
@@ -78,19 +72,14 @@ public sealed class GeminiRewriteClient : IDisposable
     }
 
     /// <summary>
-    /// Immediately emits 6 distinct 0ms local variations + 0ms next-word predictions (preserving 100% of the long text in memory)
-    /// and schedules a fast Gemini rewrite + contextual next-word prediction on the active tail window.
+    /// Emits 6 distinct local variations and schedules a fast Gemini rewrite (~800ms via gemini-2.5-flash)
+    /// when a sentence/turn commits.
     /// </summary>
     public void RequestRealtimeRewrite(string apiKey, string rawSpokenText, bool isFinalCommit = false)
     {
         string trimmed = (rawSpokenText ?? string.Empty).Trim();
         if (string.IsNullOrWhiteSpace(trimmed))
             return;
-
-        if (isFinalCommit)
-        {
-            LearnFromUserText(trimmed);
-        }
 
         long myVersion = Interlocked.Increment(ref _versionCounter);
 
@@ -101,7 +90,6 @@ public sealed class GeminiRewriteClient : IDisposable
         CancellationToken token = _pendingCts!.Token;
 
         SplitHistoryPrefixAndActiveTail(trimmed, out string rawPrefix, out string rawTail);
-        string[] instantPredictions = PredictNextWordsLocally(trimmed);
 
         RewriteVariations? prefixVarsSnapshot = null;
         RewriteVariations? cachedTailSnapshot = null;
@@ -113,7 +101,7 @@ public sealed class GeminiRewriteClient : IDisposable
                 if (_cachedRawPrefix != rawPrefix || _cachedPrefixVariations == null)
                 {
                     _cachedRawPrefix = rawPrefix;
-                    _cachedPrefixVariations = BuildLocalSixVariations(rawPrefix, instantPredictions, isAiRefined: true);
+                    _cachedPrefixVariations = BuildLocalSixVariations(rawPrefix, isAiRefined: true);
                 }
                 prefixVarsSnapshot = _cachedPrefixVariations;
             }
@@ -124,33 +112,28 @@ public sealed class GeminiRewriteClient : IDisposable
             }
         }
 
-        // If the exact active tail was already refined, emit the complete refined result immediately in 0ms!
         if (cachedTailSnapshot != null)
         {
             RewriteVariations cachedFull = CombinePrefixAndTailVariations(
                 trimmed,
                 prefixVarsSnapshot,
                 cachedTailSnapshot,
-                instantPredictions,
                 isAiRefined: true);
             OnVariationsUpdated?.Invoke(cachedFull);
             return;
         }
 
-        // Build 6 genuinely distinct local variations in 0ms for the active tail
-        RewriteVariations localTailSix = BuildLocalSixVariations(rawTail, instantPredictions, isAiRefined: false);
+        RewriteVariations localTailSix = BuildLocalSixVariations(rawTail, isAiRefined: false);
         RewriteVariations draftResult = CombinePrefixAndTailVariations(
             trimmed,
             prefixVarsSnapshot,
             localTailSix,
-            instantPredictions,
             isAiRefined: false);
 
-        // 1. Emit instant 0ms local variations (while keeping IsAiRefined = false so spinner shows during conversion)
         OnVariationsUpdated?.Invoke(draftResult);
 
-        // Fast debounce on final sentence commit (55ms); pause-based debounce during interim speech (580ms) so we never spam the API mid-word
-        int debounceMs = isFinalCommit ? 55 : 580;
+        // Only call cloud AI when sentence commits (35ms) or after a genuine speech pause (750ms)
+        int debounceMs = isFinalCommit ? 35 : 750;
 
         _ = Task.Run(async () =>
         {
@@ -167,19 +150,18 @@ public sealed class GeminiRewriteClient : IDisposable
                 }
 
                 string keyTrimmed = apiKey.Trim();
-                var aiTailResult = await FetchGeminiVariationsAsync(keyTrimmed, rawTail, instantPredictions, token);
+                var aiTailResult = await FetchGeminiVariationsAsync(keyTrimmed, rawTail, token);
 
                 if (!token.IsCancellationRequested && Interlocked.Read(ref _versionCounter) == myVersion)
                 {
                     RewriteVariations effectiveTail = aiTailResult != null
-                        ? EnsureAllSixAreDistinct(aiTailResult, localTailSix, instantPredictions)
+                        ? EnsureAllSixAreDistinct(aiTailResult, localTailSix)
                         : localTailSix with { IsAiRefined = true };
 
                     RewriteVariations fullResult = CombinePrefixAndTailVariations(
                         trimmed,
                         prefixVarsSnapshot,
                         effectiveTail,
-                        effectiveTail.SugestoesCompletar ?? instantPredictions,
                         isAiRefined: true);
 
                     lock (_prefixLock)
@@ -214,7 +196,6 @@ public sealed class GeminiRewriteClient : IDisposable
         string fullRawOriginal,
         RewriteVariations? prefixVars,
         RewriteVariations tailVars,
-        string[] suggestions,
         bool isAiRefined)
     {
         if (prefixVars == null)
@@ -222,8 +203,7 @@ public sealed class GeminiRewriteClient : IDisposable
             return tailVars with
             {
                 RawOriginal = fullRawOriginal,
-                IsAiRefined = isAiRefined,
-                SugestoesCompletar = suggestions
+                IsAiRefined = isAiRefined
             };
         }
 
@@ -235,8 +215,7 @@ public sealed class GeminiRewriteClient : IDisposable
             EmpaticaCordial: CombinePrefixAndTail(prefixVars.EmpaticaCordial, tailVars.EmpaticaCordial),
             ExplicativaClara: CombinePrefixAndTail(prefixVars.ExplicativaClara, tailVars.ExplicativaClara),
             PersuasivaConfiante: CombinePrefixAndTail(prefixVars.PersuasivaConfiante, tailVars.PersuasivaConfiante),
-            IsAiRefined: isAiRefined,
-            SugestoesCompletar: suggestions);
+            IsAiRefined: isAiRefined);
     }
 
     private static void SplitHistoryPrefixAndActiveTail(string fullText, out string historyPrefix, out string activeTail)
@@ -251,7 +230,6 @@ public sealed class GeminiRewriteClient : IDisposable
         int splitSearchStart = fullText.Length - MaxActiveRewriteTailChars;
         int splitIdx = -1;
 
-        // Prefer splitting at a sentence boundary ('. ', '! ', '? ', '\n') near the window boundary
         for (int i = splitSearchStart; i < Math.Min(fullText.Length - 80, splitSearchStart + 180); i++)
         {
             char c = fullText[i];
@@ -262,7 +240,6 @@ public sealed class GeminiRewriteClient : IDisposable
             }
         }
 
-        // Fallback to word boundary space
         if (splitIdx < 0)
         {
             int spaceIdx = fullText.IndexOf(' ', splitSearchStart);
@@ -285,30 +262,28 @@ public sealed class GeminiRewriteClient : IDisposable
     private static async Task<RewriteVariations?> FetchGeminiVariationsAsync(
         string apiKey,
         string rawSpokenText,
-        string[] fallbackPredictions,
         CancellationToken token)
     {
         string prompt =
-            "Reescreva a fala ditada (PT-BR) em 6 versões REALMENTE DIFERENTES entre si (nunca repita o mesmo texto em dois estilos), mantendo 100% dos fatos, e sugira 5 continuações curtas (1 a 4 palavras):\n" +
-            "d = 1. Técnica e Detalhada (transforme a fala em especificação técnica completa, detalhada e bem estruturada de computação/sistema, detalhando contexto, causa ou requisito com clareza)\n" +
-            "f = 2. Didática e Simples (explique o assunto de forma muito didática, acessível e em linguagem simples para leigos, esclarecendo o porquê e como funciona sem jargão difícil)\n" +
-            "c = 3. Operacional / Entrega (formato objetivo de retorno operacional em voz ativa, abrindo com 'O que foi feito:' ou 'Alinhamento operacional:', direto e focado em ação/status)\n" +
-            "e = 4. Formal e Institucional (norma culta executiva, polida, corporativa e respeitosa para comunicados oficiais, fornecedores ou diretoria)\n" +
-            "x = 5. Passo a Passo / Checklist (estruture em sequência lógica numerada '1)', '2)', '3)' com passos claros e acionáveis)\n" +
-            "p = 6. Direta e Limpa (mantenha a voz natural de quem falou, apenas removendo cacoetes/repetições da fala e corrigindo pontuação e gramática)\n" +
-            "s = array com 5 sugestões curtas de próximas palavras para completar a última frase.\n\n" +
+            "Reescreva a fala ditada (PT-BR) em 6 versões REALMENTE DIFERENTES entre si (nunca repita o mesmo texto em dois estilos), mantendo 100% dos fatos:\n" +
+            "d = 1. Técnica e Detalhada (especificação técnica clara e bem estruturada)\n" +
+            "f = 2. Didática e Simples (explicativa, acessível e em linguagem simples)\n" +
+            "c = 3. Operacional / Entrega (retorno objetivo em voz ativa, abrindo com 'O que foi feito:')\n" +
+            "e = 4. Formal e Institucional (norma culta executiva, polida e corporativa)\n" +
+            "x = 5. Passo a Passo / Checklist (sequência lógica numerada '1)', '2)', '3)')\n" +
+            "p = 6. Direta e Limpa (voz natural de quem falou, apenas corrigindo pontuação e gramática)\n\n" +
             "Fala:\n\"\"\"\n" + rawSpokenText + "\n\"\"\"\n\n" +
-            "JSON estrito: {\"d\":\"...\",\"f\":\"...\",\"c\":\"...\",\"e\":\"...\",\"x\":\"...\",\"p\":\"...\",\"s\":[\"...\",\"...\",\"...\",\"...\",\"...\"]}";
+            "JSON estrito: {\"d\":\"...\",\"f\":\"...\",\"c\":\"...\",\"e\":\"...\",\"x\":\"...\",\"p\":\"...\"}";
 
-        // Priority order of models with automatic circuit-breaker cooldown:
-        // 1. gemini-3.8-flash (thinkingBudget=0 -> primary model requested by owner, full quota availability)
-        // 2. gemini-3.5-flash (MINIMAL thinking -> fast backup)
-        // 3. gemini-3-flash-preview (MINIMAL thinking -> secondary backup)
+        // Fast verified models in priority order:
+        // 1. gemini-2.5-flash (thinkingBudget=0 -> ~800ms)
+        // 2. gemini-3-flash-preview (MINIMAL thinking -> ~1050ms)
+        // 3. gemini-3.5-flash (MINIMAL thinking -> ~1800ms)
         (string Model, bool UseBudgetZero, int TimeoutMs)[] candidates =
         {
-            ("gemini-3.8-flash", true, 9500),
-            ("gemini-3.5-flash", false, 4500),
-            ("gemini-3-flash-preview", false, 4200)
+            ("gemini-2.5-flash", true, 2800),
+            ("gemini-3-flash-preview", false, 3200),
+            ("gemini-3.5-flash", false, 3500)
         };
 
         foreach (var candidate in candidates)
@@ -329,7 +304,6 @@ public sealed class GeminiRewriteClient : IDisposable
                 candidate.UseBudgetZero,
                 candidate.TimeoutMs,
                 rawSpokenText,
-                fallbackPredictions,
                 token);
 
             if (result != null)
@@ -346,7 +320,6 @@ public sealed class GeminiRewriteClient : IDisposable
         bool useThinkingBudgetZero,
         int modelTimeoutMs,
         string rawOriginal,
-        string[] fallbackPredictions,
         CancellationToken outerToken)
     {
         using var modelTimeoutCts = new CancellationTokenSource(modelTimeoutMs);
@@ -374,7 +347,7 @@ public sealed class GeminiRewriteClient : IDisposable
                 {
                     responseMimeType = "application/json",
                     temperature = 0.35,
-                    maxOutputTokens = 750,
+                    maxOutputTokens = 650,
                     thinkingConfig = thinkingCfg
                 }
             };
@@ -392,7 +365,6 @@ public sealed class GeminiRewriteClient : IDisposable
                 if (response.StatusCode == HttpStatusCode.TooManyRequests ||
                     response.StatusCode == HttpStatusCode.NotFound)
                 {
-                    // Cooldown 429/404 model for 75 seconds so subsequent turns skip it in 0ms
                     ModelCooldownUntilUtc[model] = DateTime.UtcNow.AddSeconds(75);
                 }
                 else if ((int)response.StatusCode >= 500)
@@ -427,35 +399,6 @@ public sealed class GeminiRewriteClient : IDisposable
             string explicativa = ReadJsonString(root, "x", "explicativa");
             string persuasiva = ReadJsonString(root, "p", "persuasiva");
 
-            string[] parsedSuggestions = fallbackPredictions;
-            if ((root.TryGetProperty("s", out JsonElement sugElem) || root.TryGetProperty("sugestoes", out sugElem)) &&
-                sugElem.ValueKind == JsonValueKind.Array)
-            {
-                var list = new List<string>(5);
-                foreach (JsonElement item in sugElem.EnumerateArray())
-                {
-                    string? val = item.GetString()?.Trim().TrimStart('+', '•', '-', ' ');
-                    if (!string.IsNullOrWhiteSpace(val) && val.Length <= 42 && !list.Contains(val, StringComparer.OrdinalIgnoreCase))
-                    {
-                        list.Add(val);
-                        if (list.Count >= 5)
-                            break;
-                    }
-                }
-                if (list.Count > 0)
-                {
-                    while (list.Count < 5 && fallbackPredictions.Length > 0)
-                    {
-                        string nextFallback = fallbackPredictions[list.Count % fallbackPredictions.Length];
-                        if (!list.Contains(nextFallback, StringComparer.OrdinalIgnoreCase))
-                            list.Add(nextFallback);
-                        else
-                            break;
-                    }
-                    parsedSuggestions = list.ToArray();
-                }
-            }
-
             if (string.IsNullOrWhiteSpace(direta) && string.IsNullOrWhiteSpace(formal) && string.IsNullOrWhiteSpace(concisa))
                 return null;
 
@@ -467,8 +410,7 @@ public sealed class GeminiRewriteClient : IDisposable
                 EmpaticaCordial: empatica,
                 ExplicativaClara: explicativa,
                 PersuasivaConfiante: persuasiva,
-                IsAiRefined: true,
-                SugestoesCompletar: parsedSuggestions);
+                IsAiRefined: true);
         }
         catch (OperationCanceledException) when (outerToken.IsCancellationRequested)
         {
@@ -476,8 +418,7 @@ public sealed class GeminiRewriteClient : IDisposable
         }
         catch (OperationCanceledException)
         {
-            // Model-level timeout -> put model on brief 25s cooldown and try next candidate
-            ModelCooldownUntilUtc[model] = DateTime.UtcNow.AddSeconds(25);
+            ModelCooldownUntilUtc[model] = DateTime.UtcNow.AddSeconds(45);
             return null;
         }
         catch
@@ -495,14 +436,9 @@ public sealed class GeminiRewriteClient : IDisposable
         return string.Empty;
     }
 
-    /// <summary>
-    /// Guarantees that all 6 variations are non-empty and genuinely distinct from one another.
-    /// If any AI slot is empty or duplicates another slot, substitutes the corresponding distinct local style.
-    /// </summary>
     private static RewriteVariations EnsureAllSixAreDistinct(
         RewriteVariations ai,
-        RewriteVariations localSix,
-        string[] fallbackSuggestions)
+        RewriteVariations localSix)
     {
         var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -545,8 +481,7 @@ public sealed class GeminiRewriteClient : IDisposable
             EmpaticaCordial: e,
             ExplicativaClara: x,
             PersuasivaConfiante: p,
-            IsAiRefined: true,
-            SugestoesCompletar: ai.SugestoesCompletar ?? fallbackSuggestions);
+            IsAiRefined: true);
     }
 
     private static string NormalizeForComparison(string text)
@@ -556,28 +491,15 @@ public sealed class GeminiRewriteClient : IDisposable
         return Regex.Replace(text.Trim().ToLowerInvariant(), @"[\s,.;:!?]+", " ").Trim();
     }
 
-    /// <summary>
-    /// Instant 0ms Local 6-Style Variation Engine in Portuguese (PT-BR).
-    /// Produces 6 genuinely distinct variations aligned with the owner's workflow:
-    /// 1. Técnica e Detalhada
-    /// 2. Didática e Simples
-    /// 3. Operacional / Entrega ("O que foi feito:")
-    /// 4. Formal e Institucional
-    /// 5. Passo a Passo / Checklist (1, 2, 3)
-    /// 6. Direta e Limpa
-    /// </summary>
     public static RewriteVariations BuildLocalSixVariations(
         string rawInput,
-        string[]? suggestions = null,
         bool isAiRefined = true)
     {
         string raw = (rawInput ?? string.Empty).Trim();
-        string[] preds = suggestions ?? PredictNextWordsLocally(raw);
-
         string diretaLimpa = CleanSpokenPortugueseLocally(raw);
         if (string.IsNullOrWhiteSpace(diretaLimpa))
         {
-            return new RewriteVariations(raw, string.Empty, string.Empty, string.Empty, string.Empty, string.Empty, string.Empty, isAiRefined, preds);
+            return new RewriteVariations(raw, string.Empty, string.Empty, string.Empty, string.Empty, string.Empty, string.Empty, isAiRefined);
         }
 
         string tecnicaDetalhada = BuildTechnicalDetailedStyleLocally(diretaLimpa);
@@ -594,10 +516,9 @@ public sealed class GeminiRewriteClient : IDisposable
             EmpaticaCordial: formalInstitucional,
             ExplicativaClara: passoAPasso,
             PersuasivaConfiante: diretaLimpa,
-            IsAiRefined: isAiRefined,
-            SugestoesCompletar: preds);
+            IsAiRefined: isAiRefined);
 
-        return EnsureAllSixAreDistinct(rawSet, rawSet, preds) with { IsAiRefined = isAiRefined };
+        return EnsureAllSixAreDistinct(rawSet, rawSet) with { IsAiRefined = isAiRefined };
     }
 
     private static string BuildTechnicalDetailedStyleLocally(string cleanText)
@@ -608,10 +529,6 @@ public sealed class GeminiRewriteClient : IDisposable
         s = Regex.Replace(s, @"(?i)\bàs vezes demora muito\b", "apresenta latência elevada de processamento em determinados cenários");
         s = Regex.Replace(s, @"(?i)\bdemora muito\b", "apresenta tempo de resposta acima do esperado");
         s = Regex.Replace(s, @"(?i)\bficando lento\b", "apresentando degradação progressiva de desempenho");
-        s = Regex.Replace(s, @"(?i)\bse tem como (nós|a gente) acelerar isso\b", "sendo necessário otimizar o tempo de resposta e reduzir a latência dessa operação");
-        s = Regex.Replace(s, @"(?i)\bmexer aqui\b", "ajustar a implementação atual");
-        s = Regex.Replace(s, @"(?i)\bnegócio de mouse\b", "módulo de controle e interceptação de cursor (CursorLoop)");
-        s = Regex.Replace(s, @"(?i)\bflicando\b", "apresentando oscilação visual (flickering) de posição");
 
         s = EnsureSentenceCapitalizationAndPeriod(s);
 
@@ -628,9 +545,6 @@ public sealed class GeminiRewriteClient : IDisposable
     {
         string s = cleanText;
         s = Regex.Replace(s, @"(?i)^(olá[,.!\s]*)?(está me vendo\?\s*)?(olá[,.!\s]*)?(está me ouvindo\?\s*)", string.Empty);
-        s = Regex.Replace(s, @"(?i)\btem duas coisas que eu (quero|queria|gostaria de) ver\b[:.,\s]*", "Quero te explicar dois pontos de um jeito bem simples: ");
-        s = Regex.Replace(s, @"(?i)\bse tem como (nós|a gente) acelerar isso\b", "assim deixamos tudo funcionando mais rápido e fácil no dia a dia");
-
         s = EnsureSentenceCapitalizationAndPeriod(s);
 
         if (!s.StartsWith("Explicando", StringComparison.OrdinalIgnoreCase) &&
@@ -648,7 +562,6 @@ public sealed class GeminiRewriteClient : IDisposable
         string s = cleanText;
         s = Regex.Replace(s, @"(?i)^(olá[,.!\s]+)?(bom dia|boa tarde|boa noite)[,.!\s]*(tudo bem\??[,.!\s]*)?", string.Empty);
         s = Regex.Replace(s, @"(?i)^(olá[,.!\s]*)?(está me vendo\?\s*)?(olá[,.!\s]*)?(está me ouvindo\?\s*)", string.Empty);
-        s = Regex.Replace(s, @"(?i)^(para esclarecer|gostaria de esclarecer que|é importante destacar que|tem duas coisas que eu quero ver|quero ver duas coisas)[:.,\s]*", string.Empty);
 
         s = EnsureSentenceCapitalizationAndPeriod(s);
 
@@ -663,22 +576,8 @@ public sealed class GeminiRewriteClient : IDisposable
     private static string BuildFormalStyleLocally(string cleanText)
     {
         string s = cleanText;
-
-        // Replace conversational openings/constructions with executive Portuguese
-        s = Regex.Replace(s, @"(?i)^olá[,.!\s]*está me vendo\?\s*(olá[,.!\s]*está me ouvindo\?\s*)?", "Prezados, gostaria de confirmar se o áudio e o vídeo estão funcionando adequadamente. ");
-        s = Regex.Replace(s, @"(?i)^olá[,.!\s]*está me ouvindo\?\s*", "Prezados, gostaria de confirmar se o áudio está funcionando adequadamente. ");
-        s = Regex.Replace(s, @"(?i)\btem duas coisas que eu (quero|queria|gostaria de) ver\b[:.,\s]*", "Gostaria de alinhar dois pontos específicos: ");
-        s = Regex.Replace(s, @"(?i)\b(eu quero|eu queria) ver\b", "gostaria de avaliar");
-        s = Regex.Replace(s, @"(?i)\bquero ver\b", "gostaria de verificar");
         s = Regex.Replace(s, @"(?i)\ba gente\b", "nós");
         s = Regex.Replace(s, @"(?i)\bnão está funcionando\b", "apresenta inconsistência operacional");
-        s = Regex.Replace(s, @"(?i)\bàs vezes demora muito\b", "por vezes apresenta latência elevada");
-        s = Regex.Replace(s, @"(?i)\bdemora muito\b", "apresenta tempo de resposta elevado");
-        s = Regex.Replace(s, @"(?i)\bficando lento\b", "apresentando lentidão progressiva");
-        s = Regex.Replace(s, @"(?i)\bse tem como (nós|a gente) acelerar isso\b", "solicito avaliarmos como otimizar o tempo de processamento");
-        s = Regex.Replace(s, @"(?i)\bse tem como acelerar isso\b", "solicito avaliarmos como otimizar esse desempenho");
-        s = Regex.Replace(s, @"(?i)\bo que pode ser\?", "Qual seria o diagnóstico técnico para esse comportamento?");
-
         s = EnsureSentenceCapitalizationAndPeriod(s);
 
         if (string.Equals(NormalizeForComparison(s), NormalizeForComparison(cleanText), StringComparison.OrdinalIgnoreCase))
@@ -693,15 +592,6 @@ public sealed class GeminiRewriteClient : IDisposable
     private static string BuildStepByStepChecklistStyleLocally(string cleanText)
     {
         string s = cleanText;
-
-        if (Regex.IsMatch(s, @"(?i)\b(duas coisas|dois pontos)\b"))
-        {
-            s = Regex.Replace(s, @"(?i)\btem duas coisas que eu quero ver\b[:.,\s]*", "Passo a passo: ");
-            s = Regex.Replace(s, @"(?i)\b(a primeira é que|uma é que)\b", "1) ");
-            s = Regex.Replace(s, @"(?i)[,;.]?\s*\be (a segunda é que|dois é que)\b", "; 2) ");
-            return EnsureSentenceCapitalizationAndPeriod(s);
-        }
-
         string[] parts = Regex.Split(s, @"(?<=[.!?])\s+|[,;]\s+(?=(?:e\s+|mas\s+|então\s+|para\s+|porque\s+))")
             .Select(x => x.Trim())
             .Where(x => !string.IsNullOrWhiteSpace(x))
@@ -768,174 +658,6 @@ public sealed class GeminiRewriteClient : IDisposable
         return s;
     }
 
-    private static readonly Dictionary<string, string[]> BuiltInNextWordMap =
-        new(StringComparer.OrdinalIgnoreCase)
-        {
-            ["de"] = new[] { "acordo com", "verificar", "esclarecer que", "forma clara", "hoje" },
-            ["para"] = new[] { "que você", "esclarecer", "verificar no sistema", "resolver isso", "concluir" },
-            ["que"] = new[] { "você possa", "o sistema", "já foi", "está em andamento", "não haja dúvidas" },
-            ["no"] = new[] { "sistema", "Moodle", "momento", "portal do aluno", "final da página" },
-            ["na"] = new[] { "barra lateral", "plataforma", "matriz curricular", "disciplina", "tela" },
-            ["com"] = new[] { "sucesso", "a equipe", "certeza", "base nisso", "o suporte" },
-            ["por"] = new[] { "favor", "gentileza", "isso", "completo", "enquanto" },
-            ["em"] = new[] { "relação a", "processo de", "detalhes", "andamento", "contato" },
-            ["a"] = new[] { "partir de", "respeito de", "todos", "fim de", "informação" },
-            ["à"] = new[] { "disposição", "sua disposição", "equipe responsável", "coordenação", "secretaria" },
-            ["o"] = new[] { "sistema", "processo", "conteúdo", "mais breve possível", "que foi feito" },
-            ["os"] = new[] { "dados no sistema", "alunos", "conteúdos", "ajustes necessários", "próximos passos" },
-            ["as"] = new[] { "informações", "disciplinas", "opções ao vivo", "orientações", "alterações" },
-            ["uma"] = new[] { "mensagem", "solução rápida", "nova opção", "verificação", "dificuldade" },
-            ["um"] = new[] { "novo recurso", "ajuste rápido", "momento", "teste completo", "detalhe importante" },
-            ["não"] = new[] { "precisa", "foi possível", "há necessidade", "interfere", "se preocupe" },
-            ["já"] = new[] { "foi concluído", "está disponível", "está funcionando", "verifiquei no sistema", "foi ajustado" },
-            ["estou"] = new[] { "à disposição", "verificando agora", "encaminhando", "acompanhando", "fazendo o ajuste" },
-            ["estamos"] = new[] { "à disposição", "em processo de", "trabalhando nisso", "verificando", "finalizando" },
-            ["gostaria"] = new[] { "de incluir", "de esclarecer", "de solicitar", "que você", "de confirmar" },
-            ["quero"] = new[] { "deixar claro", "incluir um recurso", "que funcione", "verificar", "ajustar isso" },
-            ["preciso"] = new[] { "que você", "verificar no sistema", "ajustar", "de ajuda com", "confirmar" },
-            ["precisamos"] = new[] { "implementar", "verificar", "garantir que", "ajustar", "concluir" },
-            ["qualquer"] = new[] { "dúvida", "dificuldade", "problema", "alteração", "coisa me avise" },
-            ["caso"] = new[] { "encontre alguma dificuldade", "precise de ajuda", "tenha alguma dúvida", "seja necessário", "prefira" },
-            ["conforme"] = new[] { "orientei anteriormente", "combinado", "solicitado", "conversamos", "o previsto" },
-            ["esta"] = new[] { "mensagem", "sala", "disciplina", "configuração", "opção" },
-            ["esse"] = new[] { "recurso", "processo", "ajuste", "comportamento", "ponto" },
-            ["essa"] = new[] { "informação", "questão", "alteração", "disciplina", "versão" },
-            ["como"] = new[] { "orientei anteriormente", "funciona no sistema", "podemos ver", "combinado", "solicitado" },
-            ["mais"] = new[] { "detalhes", "rápido possível", "uma vez", "claro", "informações" },
-            ["muito"] = new[] { "obrigado", "bom", "importante", "melhor agora", "rápido" },
-            ["obrigado"] = new[] { "pela atenção", "pelo retorno", "pela compreensão", "desde já", "pela parceria" },
-            ["olá"] = new[] { "tudo bem?", "bom dia", "boa tarde", "boa noite", "para esclarecer:" },
-            ["bom"] = new[] { "dia, tudo bem?", "trabalho", "resultado", "saber disso", "andamento" },
-            ["boa"] = new[] { "tarde, tudo bem?", "noite, tudo bem?", "semana", "ideia", "notícia" }
-        };
-
-    private static readonly string[] DefaultGeneralContinuations =
-    {
-        "para esclarecer",
-        "no sistema",
-        "por gentileza",
-        "estou à disposição",
-        "qualquer dúvida"
-    };
-
-    public static void LearnFromUserText(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text))
-            return;
-
-        MatchCollection matches = Regex.Matches(text, @"[A-Za-zÀ-ÿ0-9]+");
-        if (matches.Count < 2)
-            return;
-
-        lock (BigramLock)
-        {
-            for (int i = 0; i < matches.Count - 1; i++)
-            {
-                string w1 = matches[i].Value.ToLowerInvariant();
-                string w2 = matches[i + 1].Value;
-                if (w1.Length < 2 || w2.Length < 2)
-                    continue;
-
-                string nextPhrase = (i + 2 < matches.Count && w2.Length <= 3)
-                    ? w2 + " " + matches[i + 2].Value
-                    : w2;
-
-                if (!LearnedNextWords.TryGetValue(w1, out var list))
-                {
-                    list = new List<string>(6);
-                    LearnedNextWords[w1] = list;
-                }
-
-                list.RemoveAll(x => string.Equals(x, nextPhrase, StringComparison.OrdinalIgnoreCase));
-                list.Insert(0, nextPhrase);
-                if (list.Count > 5)
-                {
-                    list.RemoveAt(list.Count - 1);
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// 0ms local prediction of the next 5 words/short phrases based on the user's last spoken words.
-    /// </summary>
-    public static string[] PredictNextWordsLocally(string currentText)
-    {
-        if (string.IsNullOrWhiteSpace(currentText))
-            return DefaultGeneralContinuations;
-
-        MatchCollection words = Regex.Matches(currentText.Trim(), @"[A-Za-zÀ-ÿ0-9]+");
-        if (words.Count == 0)
-            return DefaultGeneralContinuations;
-
-        string lastWord = words[^1].Value.ToLowerInvariant();
-        var results = new List<string>(5);
-
-        // 1. Check user's learned bigrams first
-        lock (BigramLock)
-        {
-            if (LearnedNextWords.TryGetValue(lastWord, out var learned))
-            {
-                foreach (string item in learned)
-                {
-                    if (!results.Contains(item, StringComparer.OrdinalIgnoreCase))
-                    {
-                        results.Add(item);
-                        if (results.Count >= 3)
-                            break;
-                    }
-                }
-            }
-        }
-
-        // 2. Check built-in Portuguese contextual map for the last word
-        if (BuiltInNextWordMap.TryGetValue(lastWord, out string[]? builtIn))
-        {
-            foreach (string item in builtIn)
-            {
-                if (!results.Contains(item, StringComparer.OrdinalIgnoreCase))
-                {
-                    results.Add(item);
-                    if (results.Count >= 5)
-                        return results.ToArray();
-                }
-            }
-        }
-
-        // 3. Check morphological patterns on the last word
-        if (lastWord.EndsWith("ar", StringComparison.Ordinal) ||
-            lastWord.EndsWith("er", StringComparison.Ordinal) ||
-            lastWord.EndsWith("ir", StringComparison.Ordinal))
-        {
-            string[] verbFollows = { "o sistema", "as informações", "isso agora", "com clareza", "rapidamente" };
-            foreach (string vf in verbFollows)
-            {
-                if (results.Count < 5 && !results.Contains(vf, StringComparer.OrdinalIgnoreCase))
-                    results.Add(vf);
-            }
-        }
-        else if (lastWord.EndsWith("ndo", StringComparison.Ordinal))
-        {
-            string[] gerundFollows = { "ao vivo", "perfeitamente", "no sistema", "as opções", "agora mesmo" };
-            foreach (string gf in gerundFollows)
-            {
-                if (results.Count < 5 && !results.Contains(gf, StringComparer.OrdinalIgnoreCase))
-                    results.Add(gf);
-            }
-        }
-
-        // 4. Fill remaining slots up to 5 with natural sentence connectors
-        foreach (string def in DefaultGeneralContinuations)
-        {
-            if (results.Count >= 5)
-                break;
-            if (!results.Contains(def, StringComparer.OrdinalIgnoreCase))
-                results.Add(def);
-        }
-
-        return results.ToArray();
-    }
-
     private static readonly HashSet<string> ProperNouns = new(StringComparer.OrdinalIgnoreCase)
     {
         "Google", "Windows", "Gemini", "Brasil", "WhatsApp", "Chrome", "Edge",
@@ -944,10 +666,16 @@ public sealed class GeminiRewriteClient : IDisposable
     };
 
     /// <summary>
-    /// Prefix-stable normalization for the active Windows cursor:
-    /// removes isolated vocalized pauses ("eh", "hum"), filler "né", exact stutters ("sem sem"),
-    /// fixes missing spaces after commas/periods, fixes PT-PT ASR constructions ("está-me a ouvir"),
-    /// and applies context-aware capitalization at index 0 without mutating earlier words as the sentence grows.
+    /// Zero-regex native passthrough for Modo Nativo Direto (RealtimeRewriteEnabled = false).
+    /// Delivers the native Gemini Live transcription directly to the cursor with 0.00ms overhead.
+    /// </summary>
+    public static string NormalizeNativeDirect(string rawChunk)
+    {
+        return string.IsNullOrWhiteSpace(rawChunk) ? string.Empty : rawChunk.Trim();
+    }
+
+    /// <summary>
+    /// Prefix-stable normalization for the active Windows cursor when 6 Options / Correction mode is enabled.
     /// </summary>
     public static string NormalizeForLiveCursor(string rawChunk, char previousLastChar)
     {
@@ -956,41 +684,19 @@ public sealed class GeminiRewriteClient : IDisposable
 
         string s = rawChunk.Trim();
 
-        // 1. Remove isolated vocalized pauses ("eh", "éh", "hum", "hã", "ahn", "uhm")
         s = Regex.Replace(s, @"(?i)(^|[\s,;]+)(eh+|éh+|hum+|hã+|ahn+|uhm+)(?=([\s,;.!?]+|$))", " ");
-
-        // 2. Remove conversational filler "né" unless preceded by meta-words ("como né", "palavra né", "escrever né")
         s = Regex.Replace(
             s,
             @"(?i)(?<!\b(como|palavra|palavras|termo|escrever|literal|dizer|falar)\s+),?\s*\bné\b\s*([?.!,;]*)",
             "$2");
-
-        // 3. Collapse consecutive duplicate words ("sem sem", "para Para", "uma uma")
         s = Regex.Replace(s, @"(?i)\b([a-zà-ÿ]+)\s+\1\b", "$1");
-
-        // 4. Convert PT-PT ASR constructions to natural PT-BR
-        s = Regex.Replace(s, @"(?i)\bestá-me a ouvir\b", "está me ouvindo");
-        s = Regex.Replace(s, @"(?i)\bestá-me a ver\b", "está me vendo");
-        s = Regex.Replace(s, @"(?i)\bestou a (falar|dizer|escrever|ver|tentar|fazer)\b", "estou $1ndo");
-
-        // 5. Fix common ASR merged words and missing space after punctuation ("ver.uma", "funcionando.e", "frasesvariadas")
         s = Regex.Replace(s, @"([,;:!?])(?=[A-Za-zÀ-ÿ])", "$1 ");
-        s = Regex.Replace(s, @"([a-zà-ÿ]{2,})\.(?=[a-zà-ÿA-ZÀ-Ÿ]{2,})", "$1. ");
-        s = Regex.Replace(s, @"(?i)\b(frases)(variadas|longas|curtas|diferentes|prontas)\b", "$1 $2");
-        s = Regex.Replace(s, @"(?i)\b(uma|um)(coesa|coeso|opção|forma|ideia|coisa|entrega|aplicação|ferramenta|versão|situação)\b", "$1 $2");
-        s = Regex.Replace(s, @"(?i)\b(usado|falando|fazendo|usando|clicando|escrevendo)(alguma|algum|aquilo|aquele|aquela|isso|essa|esse)\b", "$1 $2");
-
-        // 6. Clean orphaned punctuation and extra spaces
         s = Regex.Replace(s, @"\s+([,;.!?])", "$1");
-        s = Regex.Replace(s, @",\s*,+", ",");
-        s = Regex.Replace(s, @"^[\s,;]+", string.Empty);
         s = Regex.Replace(s, @"\s{2,}", " ").Trim();
 
         if (string.IsNullOrEmpty(s))
             return string.Empty;
 
-        // 7. Context-aware capitalization:
-        // Only capitalize the first word if starting the field or after '.', '!', '?', '\n'.
         bool isSentenceStart =
             previousLastChar == '\0' ||
             previousLastChar == '.' ||
@@ -998,22 +704,9 @@ public sealed class GeminiRewriteClient : IDisposable
             previousLastChar == '?' ||
             previousLastChar == '\n';
 
-        if (isSentenceStart)
+        if (isSentenceStart && char.IsLower(s[0]))
         {
-            if (char.IsLower(s[0]))
-            {
-                s = char.ToUpper(s[0]) + s[1..];
-            }
-        }
-        else if (char.IsUpper(s[0]))
-        {
-            Match firstWordMatch = Regex.Match(s, @"^[A-Za-zÀ-ÿ]+");
-            string firstWord = firstWordMatch.Success ? firstWordMatch.Value : string.Empty;
-            bool isAllCapsAcronym = firstWord.Length > 1 && firstWord == firstWord.ToUpperInvariant();
-            if (!isAllCapsAcronym && !ProperNouns.Contains(firstWord))
-            {
-                s = char.ToLower(s[0]) + s[1..];
-            }
+            s = char.ToUpper(s[0]) + s[1..];
         }
 
         return s;
@@ -1025,22 +718,6 @@ public sealed class GeminiRewriteClient : IDisposable
         if (string.IsNullOrEmpty(s))
             return string.Empty;
 
-        // Additional polish for tooltip variations
-        s = Regex.Replace(s, @"(?i),?\s*\b(sabe assim|tipo assim)\b\s*,?", " ");
-        s = Regex.Replace(s, @"(?i)\b(nessa|nesse|essa|esse|na|no)\s+(nessa|nesse|essa|esse|na|no)\b", "$2");
-        s = Regex.Replace(s, @"(?i)\bver\.\s*uma\s+é\s+que\b", "ver: a primeira é que");
-        s = Regex.Replace(s, @"(?i)\bfuncionando\.\s*e\s+dois\?\s*é\s+que\b", "funcionando, e a segunda é que");
-        s = Regex.Replace(s, @"(?i)\be\s+dois\?\s*é\s+que\b", "e a segunda é que");
-        s = Regex.Replace(s, @"\bTá\b", "Está");
-        s = Regex.Replace(s, @"\btá\b", "está");
-        s = Regex.Replace(s, @"\bTô\b", "Estou");
-        s = Regex.Replace(s, @"\btô\b", "estou");
-        s = Regex.Replace(s, @"\bTava\b", "Estava");
-        s = Regex.Replace(s, @"\btava\b", "estava");
-        s = Regex.Replace(s, @"\bPra\b", "Para");
-        s = Regex.Replace(s, @"\bpra\b", "para");
-
-        // Ensure uppercase after '. ', '! ', '? '
         s = Regex.Replace(s, @"([.!?]\s+)([a-zà-ÿ])", m => m.Groups[1].Value + m.Groups[2].Value.ToUpperInvariant());
         s = Regex.Replace(s, @"\s{2,}", " ").Trim();
 
@@ -1051,7 +728,26 @@ public sealed class GeminiRewriteClient : IDisposable
         return s;
     }
 
-    private static int CountWords(string s) => Regex.Matches(s, @"\S+").Count;
+    private static int CountWords(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s))
+            return 0;
+        int count = 0;
+        bool inWord = false;
+        foreach (char c in s)
+        {
+            if (char.IsWhiteSpace(c))
+            {
+                inWord = false;
+            }
+            else if (!inWord)
+            {
+                inWord = true;
+                count++;
+            }
+        }
+        return count;
+    }
 
     public void Dispose()
     {

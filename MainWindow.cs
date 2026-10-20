@@ -272,8 +272,12 @@ public sealed class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Center
         };
 
-        _rewriteToggleButton = CreateSmallActionButton("✨ 6 ON", "Barra Lateral Nativa");
-        _rewriteToggleButton.Visibility = Visibility.Collapsed;
+        _rewriteToggleButton = CreateSmallActionButton(
+            _cursorSettings.GetRewriteModePillText(),
+            "Alternar entre Modo Nativo Direto (sem correção e sem 6 opções, máxima velocidade) e Modo 6 Opções de Escrita");
+        _rewriteToggleButton.Foreground = _cursorSettings.RealtimeRewriteEnabled ? BrushGreenReady : BrushSkyBlue;
+        _rewriteToggleButton.Click += (_, _) => ToggleRealtimeRewriteMode();
+        _rewriteDeck.SetRealtimeRewriteMode(_cursorSettings.RealtimeRewriteEnabled);
 
         _cursorLoopButton = CreateSmallActionButton(
             _cursorSettings.GetLoopPillText(),
@@ -299,6 +303,7 @@ public sealed class MainWindow : Window
         var closeButton = CreateSmallActionButton("—", "Minimizar a barra lateral para o ícone da bandeja do relógio (clique no ícone da bandeja para restaurar)");
         closeButton.Click += (_, _) => MinimizeToTray();
 
+        actionsPanel.Children.Add(_rewriteToggleButton);
         actionsPanel.Children.Add(_cursorLoopButton);
         actionsPanel.Children.Add(_cursorSpeedButton);
         actionsPanel.Children.Add(closeButton);
@@ -365,10 +370,7 @@ public sealed class MainWindow : Window
             _ = ApplyChosenVariationToCursorAsync(chosenText, label);
         };
 
-        _rewriteDeck.OnPredictionChipClicked += wordToAppend =>
-        {
-            _ = AppendPredictedCompletionToCursorAsync(wordToAppend);
-        };
+        _rewriteDeck.OnToggleRewriteModeRequested += ToggleRealtimeRewriteMode;
 
         _rewriteDeck.OnRestorePreviousRequested += () =>
         {
@@ -451,7 +453,14 @@ public sealed class MainWindow : Window
                 if (!string.IsNullOrEmpty(sealedChunk))
                 {
                     _currentBlockCommittedText = CombineBlockText(_currentBlockCommittedText, sealedChunk);
-                    _rewriter.RequestRealtimeRewrite(_cachedApiKey, _currentBlockCommittedText, isFinalCommit: true);
+                    if (_cursorSettings.RealtimeRewriteEnabled)
+                    {
+                        _rewriter.RequestRealtimeRewrite(_cachedApiKey, _currentBlockCommittedText, isFinalCommit: true);
+                    }
+                    else
+                    {
+                        _rewriteDeck.UpdateNativeLivePreview(_currentBlockCommittedText, isFinal: true);
+                    }
                 }
             }
 
@@ -506,7 +515,7 @@ public sealed class MainWindow : Window
         ApplyNativeLayout();
 
         string currentText = CombineBlockText(_currentBlockCommittedText, _activeCursorInterim);
-        if (!string.IsNullOrWhiteSpace(currentText))
+        if (!string.IsNullOrWhiteSpace(currentText) && _cursorSettings.RealtimeRewriteEnabled)
         {
             string apiKey = !string.IsNullOrWhiteSpace(_cachedApiKey)
                 ? _cachedApiKey
@@ -812,13 +821,11 @@ public sealed class MainWindow : Window
                 {
                     restored = GeminiRewriteClient.BuildLocalSixVariations(
                         restored.RawOriginal,
-                        restored.SugestoesCompletar,
                         isAiRefined: true);
                 }
 
                 // Store the last session's message inside '⏪ Anterior' so the active panel starts 100% clean without residue!
                 _previousArchivedVariations = restored;
-                GeminiRewriteClient.LearnFromUserText(restored.RawOriginal);
                 _rewriteDeck.ResetDisplay();
                 _rewriteDeck.SetPreviousBackupAvailable(true);
             }
@@ -826,7 +833,10 @@ public sealed class MainWindow : Window
         catch { }
     }
 
-    private void ArchiveAndAutoClearForNewConversation(bool updateDeckImmediately, string? customReason = null)
+    private void ArchiveAndAutoClearForNewConversation(
+        bool updateDeckImmediately,
+        string? customReason = null,
+        bool cutOffServerTurn = true)
     {
         if (_latestVariationsSnapshot != null && !string.IsNullOrWhiteSpace(_latestVariationsSnapshot.RawOriginal))
         {
@@ -847,8 +857,10 @@ public sealed class MainWindow : Window
         _lastAutoSealedText = string.Empty;
         _needsLeadingSpace = false;
 
-        // Cut off the server's audio turn prefix and cancel any in-flight AI rewrite so zero residue can ever return
-        _gemini.CutOffServerTurn();
+        if (cutOffServerTurn)
+        {
+            _gemini.CutOffServerTurn();
+        }
         _rewriter.ResetMemoryCache();
         DeleteSavedConversationState();
 
@@ -900,14 +912,15 @@ public sealed class MainWindow : Window
     }
 
     private bool _wasEnterDown;
+    private IntPtr _lastCheckedFgHwnd = IntPtr.Zero;
+    private bool _lastCheckedFgEligible;
+    private IntPtr _cachedMyHwnd = IntPtr.Zero;
 
     private void TrackActiveExternalWindow()
     {
         bool enterDown = NativeInterop.IsPlainEnterPressed();
         if (enterDown && !_wasEnterDown)
         {
-            // Pressing plain Enter sends the message in chats/editors:
-            // seal any open interim into the current block, archive it to '⏪ Anterior', and immediately clear for the next conversation!
             if (!string.IsNullOrEmpty(_activeCursorInterim))
             {
                 string sealedChunk = _activeCursorInterim.Trim();
@@ -922,7 +935,7 @@ public sealed class MainWindow : Window
             {
                 ArchiveAndAutoClearForNewConversation(
                     updateDeckImmediately: true,
-                    customReason: "✨ ENVIADA (ENTER) E LIMPA • Pronta p/ próxima fala (salvo em '⏪ Anterior')");
+                    customReason: "✨ ENVIADA (ENTER) E LIMPA • Pronta p/ próxima fala");
             }
         }
         _wasEnterDown = enterDown;
@@ -931,17 +944,25 @@ public sealed class MainWindow : Window
         if (fg == IntPtr.Zero)
             return;
 
-        IntPtr myHwnd = new WindowInteropHelper(this).Handle;
-        if (fg == myHwnd)
+        if (_cachedMyHwnd == IntPtr.Zero)
+        {
+            _cachedMyHwnd = new WindowInteropHelper(this).Handle;
+        }
+        if (fg == _cachedMyHwnd)
             return;
 
-        // Ignore desktop/taskbar/shell windows when minimizing or switching screens
-        if (!NativeInterop.IsEligibleExternalWindowOnSameMonitor(fg, IntPtr.Zero))
+        // Fast-path: only call Win32 window eligibility checks when the foreground HWND actually changed!
+        if (fg != _lastCheckedFgHwnd)
+        {
+            _lastCheckedFgHwnd = fg;
+            _lastCheckedFgEligible = NativeInterop.IsEligibleExternalWindowOnSameMonitor(fg, IntPtr.Zero);
+        }
+
+        if (!_lastCheckedFgEligible)
             return;
 
         if (_lastTargetWindowHwnd != IntPtr.Zero && fg != _lastTargetWindowHwnd)
         {
-            // User clicked another window: seal any open interim into _currentBlockCommittedText and lock server turn prefix
             if (!string.IsNullOrEmpty(_activeCursorInterim))
             {
                 string sealedChunk = _activeCursorInterim.Trim();
@@ -968,7 +989,6 @@ public sealed class MainWindow : Window
         else
             result = committed.Trim() + " " + currentChunk.Trim();
 
-        // High-capacity memory ceiling (250,000 characters ~ 40,000+ words)
         if (result.Length > 250_000)
         {
             result = result[^220_000..].TrimStart();
@@ -999,17 +1019,13 @@ public sealed class MainWindow : Window
         double silenceBeforeSpeechSecs = (now - _lastInterimUiUtc).TotalSeconds;
         _lastInterimUiUtc = now;
 
-        // Smart Auto-Clear Cut-Off on New Speech:
-        // If an option was applied OR the user stayed silent >= 8 seconds before resuming speech,
-        // archive the previous conversation into '⏪ Anterior' and start this new speech 100% clean from zero!
+        // Do NOT call CutOffServerTurn() here because `interim` is ALREADY the new speech from the server!
         if (_hasAppliedInCurrentCycle ||
             (!string.IsNullOrWhiteSpace(_currentBlockCommittedText) && silenceBeforeSpeechSecs >= 8.0))
         {
-            ArchiveAndAutoClearForNewConversation(updateDeckImmediately: false);
+            ArchiveAndAutoClearForNewConversation(updateDeckImmediately: false, cutOffServerTurn: false);
         }
 
-        // If the server started a brand-new short interim turn while a long previous interim was still open,
-        // seal the previous phrase in place and record it in _lastAutoSealedText so a late FinalTranscript won't duplicate it.
         if (_activeCursorInterim.Length >= 14 &&
             interim.Trim().Length <= _activeCursorInterim.Length / 2 &&
             !_activeCursorInterim.TrimStart().StartsWith(interim.Trim(), StringComparison.OrdinalIgnoreCase))
@@ -1025,7 +1041,11 @@ public sealed class MainWindow : Window
             }
         }
 
-        string normalized = GeminiRewriteClient.NormalizeForLiveCursor(interim, GetPreviousCommittedLastChar());
+        bool rewriteEnabled = _cursorSettings.RealtimeRewriteEnabled;
+        string normalized = rewriteEnabled
+            ? GeminiRewriteClient.NormalizeForLiveCursor(interim, GetPreviousCommittedLastChar())
+            : GeminiRewriteClient.NormalizeNativeDirect(interim);
+
         if (string.IsNullOrEmpty(normalized))
         {
             return;
@@ -1042,13 +1062,14 @@ public sealed class MainWindow : Window
 
         if (_rewriteTooltipEnabled)
         {
-            string fullBlock = CombineBlockText(_currentBlockCommittedText, normalized);
-            _rewriteDeck.SetConvertingLiveState(fullBlock.Length, fullBlock);
-
-            if ((now - _lastInterimRewriteUtc).TotalMilliseconds >= 320)
+            if (rewriteEnabled)
             {
-                _lastInterimRewriteUtc = now;
-                _rewriter.RequestRealtimeRewrite(_cachedApiKey, fullBlock, isFinalCommit: false);
+                string fullBlock = CombineBlockText(_currentBlockCommittedText, normalized);
+                _rewriteDeck.SetConvertingLiveState(fullBlock.Length, fullBlock);
+            }
+            else
+            {
+                _rewriteDeck.UpdateNativeLivePreview(normalized, isFinal: false);
             }
         }
     }
@@ -1078,22 +1099,23 @@ public sealed class MainWindow : Window
         double silenceBeforeSpeechSecs = (now - _lastInterimUiUtc).TotalSeconds;
         _lastInterimUiUtc = now;
 
-        // Smart Auto-Clear Cut-Off on New Speech:
         if (_hasAppliedInCurrentCycle ||
             (!string.IsNullOrWhiteSpace(_currentBlockCommittedText) && silenceBeforeSpeechSecs >= 8.0))
         {
-            ArchiveAndAutoClearForNewConversation(updateDeckImmediately: false);
+            ArchiveAndAutoClearForNewConversation(updateDeckImmediately: false, cutOffServerTurn: false);
         }
 
-        string cleaned = GeminiRewriteClient.NormalizeForLiveCursor(finalText, GetPreviousCommittedLastChar());
+        bool rewriteEnabled = _cursorSettings.RealtimeRewriteEnabled;
+        string cleaned = rewriteEnabled
+            ? GeminiRewriteClient.NormalizeForLiveCursor(finalText, GetPreviousCommittedLastChar())
+            : GeminiRewriteClient.NormalizeNativeDirect(finalText);
+
         if (string.IsNullOrEmpty(cleaned))
         {
             _activeCursorInterim = string.Empty;
             return;
         }
 
-        // If this phrase was already auto-sealed when a new interim turn started (or after 2.8s watchdog),
-        // do NOT wipe the new _activeCursorInterim and do NOT duplicate it in _currentBlockCommittedText!
         if (WasAlreadyAutoSealed(cleaned, _lastAutoSealedText, _lastAutoSealedUtc))
         {
             _lastAutoSealedText = string.Empty;
@@ -1122,7 +1144,14 @@ public sealed class MainWindow : Window
         _currentBlockCommittedText = CombineBlockText(_currentBlockCommittedText, cleaned);
         if (_rewriteTooltipEnabled)
         {
-            _rewriter.RequestRealtimeRewrite(_cachedApiKey, _currentBlockCommittedText, isFinalCommit: true);
+            if (rewriteEnabled)
+            {
+                _rewriter.RequestRealtimeRewrite(_cachedApiKey, _currentBlockCommittedText, isFinalCommit: true);
+            }
+            else
+            {
+                _rewriteDeck.UpdateNativeLivePreview(_currentBlockCommittedText, isFinal: true);
+            }
         }
 
         _sessionTranscript = string.IsNullOrEmpty(_sessionTranscript)
@@ -1135,9 +1164,9 @@ public sealed class MainWindow : Window
 
         int words = Regex.Matches(cleaned, @"\S+").Count;
         _wordsTypedCount += words;
-        _statusText.Text = _rewriteTooltipEnabled
+        _statusText.Text = (_rewriteTooltipEnabled && rewriteEnabled)
             ? $"DIGITADO NO CURSOR ({_wordsTypedCount} palavras) • Clique numa das 6 opções acima para substituir"
-            : $"DIGITADO NO CURSOR ({_wordsTypedCount} palavras)";
+            : $"⚡ DIGITADO DIRETO NO CURSOR ({_wordsTypedCount} palavras • Modo Nativo)";
     }
 
     private async Task ApplyChosenVariationToCursorAsync(string chosenText, string label)
@@ -1148,13 +1177,11 @@ public sealed class MainWindow : Window
         _isApplyingVariation = true;
         try
         {
-            // 1. Cut off any active interim speech so it doesn't interfere with the replacement
             _activeCursorInterim = string.Empty;
             _lastAutoSealedText = string.Empty;
             _ignoreSpeechUntilUtc = DateTime.UtcNow.AddMilliseconds(500);
             _gemini.ClearInterimState();
 
-            // 2. Put the chosen text into the Clipboard so it pastes all at once in a single shot
             try
             {
                 Clipboard.SetDataObject(chosenText, true);
@@ -1164,7 +1191,6 @@ public sealed class MainWindow : Window
                 try { Clipboard.SetText(chosenText); } catch { }
             }
 
-            // 3. Ensure the target editor/chat window is in the foreground before sending Ctrl+A -> Ctrl+V
             IntPtr myHwnd = new WindowInteropHelper(this).Handle;
             IntPtr currentFg = NativeInterop.GetForegroundWindowHandle();
 
@@ -1175,12 +1201,10 @@ public sealed class MainWindow : Window
                 await Task.Delay(35);
             }
 
-            // 4. Select all text in the active input box (Ctrl+A) and paste the entire chosen text at once (Ctrl+V)
             NativeInterop.SendSelectAll();
             await Task.Delay(20);
             NativeInterop.SendPasteClipboard();
 
-            // 5. IMMEDIATELY auto-clear the 6 cards after use (saving the used conversation into '⏪ Anterior')!
             ArchiveAndAutoClearForNewConversation(
                 updateDeckImmediately: true,
                 customReason: $"☑ APLICADA ({label.ToUpperInvariant()}) E LIMPA • Fale a próxima (ou clique em '⏪ Anterior')");
@@ -1195,69 +1219,37 @@ public sealed class MainWindow : Window
         }
     }
 
-    private async Task AppendPredictedCompletionToCursorAsync(string wordToAppend)
+    public void ToggleRealtimeRewriteMode()
     {
-        string cleanedWord = (wordToAppend ?? string.Empty).Trim();
-        if (string.IsNullOrEmpty(cleanedWord) || _isApplyingVariation)
-            return;
+        _cursorSettings.ToggleRealtimeRewriteOnBar();
+        bool enabled = _cursorSettings.RealtimeRewriteEnabled;
 
-        _isApplyingVariation = true;
-        try
+        _rewriteToggleButton.Content = _cursorSettings.GetRewriteModePillText();
+        _rewriteToggleButton.Foreground = enabled ? BrushGreenReady : BrushSkyBlue;
+        _rewriteDeck.SetRealtimeRewriteMode(enabled);
+
+        if (!enabled)
         {
-            // Extending the sentence via a completion chip means the user is still composing this message
-            _hasAppliedInCurrentCycle = false;
-
-            // 1. If the user was mid-sentence in an open interim turn, seal the interim words in place first
-            if (!string.IsNullOrEmpty(_activeCursorInterim))
+            _rewriter.ResetMemoryCache();
+            if (!string.IsNullOrWhiteSpace(_currentBlockCommittedText))
             {
-                string sealedPrev = _activeCursorInterim.Trim();
-                _lastAutoSealedText = _activeCursorInterim;
-                _lastAutoSealedUtc = DateTime.UtcNow;
-                _needsLeadingSpace = !_activeCursorInterim.EndsWith(' ') && !_activeCursorInterim.EndsWith('\n');
-                _activeCursorInterim = string.Empty;
-                _gemini.ClearInterimState();
-                if (!string.IsNullOrEmpty(sealedPrev))
-                {
-                    _currentBlockCommittedText = CombineBlockText(_currentBlockCommittedText, sealedPrev);
-                }
+                _rewriteDeck.UpdateNativeLivePreview(_currentBlockCommittedText, isFinal: true);
             }
-
-            // 2. Focus the active target window if needed
-            IntPtr myHwnd = new WindowInteropHelper(this).Handle;
-            IntPtr currentFg = NativeInterop.GetForegroundWindowHandle();
-
-            if (_lastTargetWindowHwnd != IntPtr.Zero &&
-                (currentFg == IntPtr.Zero || currentFg == myHwnd || currentFg != _lastTargetWindowHwnd))
-            {
-                NativeInterop.ForceForegroundWindow(_lastTargetWindowHwnd);
-                await Task.Delay(25);
-            }
-
-            // 3. Type the predicted completion directly at the active cursor position
-            bool needsSpace = _needsLeadingSpace || !string.IsNullOrEmpty(_currentBlockCommittedText);
-            string textToType = (needsSpace ? " " : string.Empty) + cleanedWord;
-            NativeInterop.TypeUnicodeText(textToType);
-
-            _needsLeadingSpace = !cleanedWord.EndsWith(' ') && !cleanedWord.EndsWith('\n');
-            _currentBlockCommittedText = CombineBlockText(_currentBlockCommittedText, cleanedWord);
-
-            int addedWords = Regex.Matches(cleanedWord, @"\S+").Count;
-            _wordsTypedCount += addedWords;
-
-            _livePreviewText.Text = "🔮 + " + RewriteDeckView.FormatRollingTailForCard(_currentBlockCommittedText, 130);
-            _livePreviewText.Foreground = BrushGreenReady;
-            _statusText.Text = $"🔮 COMPLETADO NO CURSOR: \"{cleanedWord}\"";
-
-            // 4. Immediately advance next-word suggestions and refresh the 6 variations
-            if (_rewriteTooltipEnabled)
-            {
-                _rewriter.RequestRealtimeRewrite(_cachedApiKey, _currentBlockCommittedText, isFinalCommit: true);
-            }
+            _statusText.Text = "⚡ MODO NATIVO DIRETO ATIVO • SEM CORREÇÃO E SEM 6 OPÇÕES (MÁXIMA VELOCIDADE)";
         }
-        finally
+        else
         {
-            _isApplyingVariation = false;
+            string currentText = CombineBlockText(_currentBlockCommittedText, _activeCursorInterim);
+            if (!string.IsNullOrWhiteSpace(currentText))
+            {
+                string apiKey = !string.IsNullOrWhiteSpace(_cachedApiKey)
+                    ? _cachedApiKey
+                    : (NativeInterop.ReadApiKeyFromVault() ?? string.Empty);
+                _rewriter.RequestRealtimeRewrite(apiKey, currentText, isFinalCommit: true);
+            }
+            _statusText.Text = "✨ MODO 6 OPÇÕES DE ESCRITA ATIVADO";
         }
+        UpdateTrayTooltip();
     }
 
     /// <summary>
@@ -1678,6 +1670,7 @@ public sealed class MainWindow : Window
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("📌 Maximizar na Barra Lateral / Minimizar para a Bandeja", null, (_, _) => Dispatcher.BeginInvoke(ToggleSidebarOrTray));
         menu.Items.Add("🎙️ Iniciar/Parar Ditado por Voz (F8)", null, (_, _) => Dispatcher.BeginInvoke(async () => await ToggleDictationAsync()));
+        menu.Items.Add("⚡ Alternar Modo Nativo Direto vs. 6 Opções de Escrita", null, (_, _) => Dispatcher.BeginInvoke(ToggleRealtimeRewriteMode));
         if (CursorLoopSettings.IsCursorLoopSupported)
         {
             menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());

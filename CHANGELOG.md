@@ -4,6 +4,14 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.2] — 20/10/2026
+
+- ⚡ **Modo Nativo Direto (Flag Só Nativo vs. 6 Opções):** opção para usar apenas a transcrição nativa direta no cursor, sem correção e sem gerar as 6 opções de escrita.
+- 🧹 **Remoção do completador de palavras (Próxima Palavra):** retirado o bloco de sugestões de palavras para eliminar processamento extra a cada sílaba.
+- 🚀 **Otimização profunda de performance em tempo real:** substituição do modelo que causava timeout de 9,5s pelo gemini-2.5-flash (~800ms), eliminação de chamadas de IA durante a fala parcial, preservação contínua do buffer de áudio WebSocket e cache de janela ativa Win32.
+
+---
+
 ## [v1.3.1] — 18/10/2026
 
 - 🔀 **Loop e Velocidade independentes:** separação entre o botão de repetição de borda (Loop ON/OFF) e o seletor de velocidade (1.0x, 1.8x, 2.8x, 4.5x).
