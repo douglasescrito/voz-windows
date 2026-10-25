@@ -498,8 +498,12 @@ public sealed class MainWindow : Window
 
         AutoUpdateService.CleanupOldExecutableOnStartup();
         TryRestoreLastConversationState();
-        if (openCursorLoopOnStart)
-            CycleCursorLoopModeOnBar();
+        if (CursorLoopSettings.IsCursorLoopSupported)
+        {
+            _cursorSettings.Enabled = true;
+            _cursorSettings.Save();
+            ApplyCursorLoopToBar();
+        }
 
         RefreshTrayIconVisual();
         StartAutoUpdateChecker();

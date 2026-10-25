@@ -169,9 +169,23 @@ public sealed class CursorLoopSettings
 
         if (loaded is not null)
         {
+            // Sempre iniciar com o teletransporte de borda (Loop ON) ativo ao abrir o aplicativo na maquina do dono
+            loaded.Enabled = true;
+            loaded.HorizontalLoop = true;
+            loaded.VerticalLoop = true;
+            loaded.Save();
             return loaded;
         }
-        return new CursorLoopSettings { Enabled = true, SpeedLevel = 1, RealtimeRewriteEnabled = false };
+        var defaultSettings = new CursorLoopSettings
+        {
+            Enabled = true,
+            SpeedLevel = 1,
+            RealtimeRewriteEnabled = false,
+            HorizontalLoop = true,
+            VerticalLoop = true
+        };
+        defaultSettings.Save();
+        return defaultSettings;
     }
 
     public void Save()
