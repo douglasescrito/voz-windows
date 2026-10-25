@@ -4,6 +4,12 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.3] — 24/10/2026
+
+- 🚫 **Sem inicialização automática com o Windows:** removida a gravação automática no registro de inicialização (Run), abrindo o aplicativo somente quando o usuário desejar.
+
+---
+
 ## [v1.3.2] — 20/10/2026
 
 - ⚡ **Modo Nativo Direto (Flag Só Nativo vs. 6 Opções):** opção para usar apenas a transcrição nativa direta no cursor, sem correção e sem gerar as 6 opções de escrita.

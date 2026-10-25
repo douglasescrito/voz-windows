@@ -196,12 +196,8 @@ public sealed class CursorLoopSettings
             using var key = Registry.CurrentUser.OpenSubKey(RunRegistryPath, true);
             if (key is null) return;
             key.DeleteValue("CursorLoop", false);
-            if (!IsOwnerWorkspaceMachine())
-            {
-                key.DeleteValue(RunValueName, false);
-                return;
-            }
-            key.SetValue(RunValueName, $"\"{exePath}\"");
+            key.DeleteValue(RunValueName, false);
+            key.DeleteValue("VozWindows", false);
         }
         catch { }
     }
