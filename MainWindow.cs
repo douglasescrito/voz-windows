@@ -61,7 +61,7 @@ public sealed class MainWindow : Window
 
     private volatile bool _isListening;
     private volatile bool _isCompact = false;
-    private bool _rewriteTooltipEnabled = true; // Always docked in Native Sidebar when visible
+    private bool _rewriteTooltipEnabled = false; // Starts hidden in System Tray (without sidebar)
     private bool _liveCursorMode = true;
     private double _expandedLeft;
     private double _expandedTop;
@@ -238,7 +238,7 @@ public sealed class MainWindow : Window
         };
         _statusText = new TextBlock
         {
-            Text = "INICIANDO VOZ (F8)...",
+            Text = "MICROFONE DESLIGADO • Aperte F8 para falar",
             FontSize = 10,
             FontWeight = FontWeights.SemiBold,
             Foreground = BrushMutedGray,
@@ -249,7 +249,7 @@ public sealed class MainWindow : Window
 
         _livePreviewText = new TextBlock
         {
-            Text = "Ouvindo ao vivo...",
+            Text = "Pronto na bandeja (F8 para ativar voz)...",
             FontSize = 11.5,
             FontWeight = FontWeights.Medium,
             Foreground = BrushWhiteText,
@@ -330,20 +330,6 @@ public sealed class MainWindow : Window
 
         // Start background listener for IPC events (--cursorloop, Start Menu click)
         StartIpcSignalListener();
-
-        Loaded += async (_, _) =>
-        {
-            AutoUpdateService.CleanupOldExecutableOnStartup();
-            TryRestoreLastConversationState();
-            MaximizeToSidebar(ensureListening: false);
-            if (openCursorLoopOnStart)
-                CycleCursorLoopModeOnBar();
-
-            StartAutoUpdateChecker();
-
-            // Automatically start F8 voice dictation right when the application opens!
-            await StartDictationAsync();
-        };
 
         // Wire embedded RewriteDeckView callbacks
         _rewriter.OnVariationsUpdated += variations =>
@@ -501,6 +487,25 @@ public sealed class MainWindow : Window
     }
 
     /// <summary>
+    /// Initializes the hidden Win32 handle (for global hotkeys F8 / Ctrl+Alt+0..3) and background services
+    /// while keeping the sidebar CLOSED and the microphone DISABLED (only showing the System Tray icon).
+    /// </summary>
+    public void InitializeTrayOnlyStartup(bool openCursorLoopOnStart = false)
+    {
+        _rewriteTooltipEnabled = false;
+        _isListening = false;
+        _ = new WindowInteropHelper(this).EnsureHandle();
+
+        AutoUpdateService.CleanupOldExecutableOnStartup();
+        TryRestoreLastConversationState();
+        if (openCursorLoopOnStart)
+            CycleCursorLoopModeOnBar();
+
+        RefreshTrayIconVisual();
+        StartAutoUpdateChecker();
+    }
+
+    /// <summary>
     /// Mode 1: Maximized in the Native Windows Sidebar on the right edge of the screen.
     /// </summary>
     public void MaximizeToSidebar(bool ensureListening = false)
@@ -547,7 +552,7 @@ public sealed class MainWindow : Window
         }
         else
         {
-            MaximizeToSidebar(ensureListening: true);
+            MaximizeToSidebar(ensureListening: false);
         }
     }
 
@@ -737,7 +742,7 @@ public sealed class MainWindow : Window
         _lastAutoSealedText = string.Empty;
         _needsLeadingSpace = false;
 
-        if (!IsVisible)
+        if (_rewriteTooltipEnabled && !IsVisible)
             Show();
 
         // Update UI to active listening state (True Dark border without blue frame)
@@ -1507,14 +1512,14 @@ public sealed class MainWindow : Window
                     {
                         Dispatcher.BeginInvoke(() =>
                         {
-                            MaximizeToSidebar(ensureListening: true);
+                            PromoteTrayIconNextToClock();
+                            RefreshTrayIconVisual();
                         });
                     }
                     else if (ReferenceEquals(triggered, _cursorLoopEvent) || ReferenceEquals(triggered, _legacyLoopEvent))
                     {
                         Dispatcher.BeginInvoke(() =>
                         {
-                            MaximizeToSidebar(ensureListening: false);
                             CycleCursorLoopModeOnBar();
                         });
                     }

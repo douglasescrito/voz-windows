@@ -135,7 +135,10 @@ public static class Program
         System.Windows.Forms.Application.EnableVisualStyles();
         System.Windows.Forms.Application.SetCompatibleTextRenderingDefault(false);
 
-        var app = new System.Windows.Application();
+        var app = new System.Windows.Application
+        {
+            ShutdownMode = ShutdownMode.OnExplicitShutdown
+        };
         app.DispatcherUnhandledException += (_, e) =>
         {
             e.Handled = true;
@@ -150,6 +153,7 @@ public static class Program
             cursorLoopEvent,
             legacyLoopEvent,
             openCursorLoopOnStart: wantCursorLoop);
+        win.Closed += (_, _) => app.Shutdown();
 
         if (args.Length >= 3 && args[0] == "--verify-demo")
         {
@@ -169,9 +173,12 @@ public static class Program
                         win.Close();
                 }
             };
+            app.Run(win);
+            return 0;
         }
 
-        app.Run(win);
+        win.InitializeTrayOnlyStartup(openCursorLoopOnStart: wantCursorLoop);
+        app.Run();
         return 0;
     }
 }

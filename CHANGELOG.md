@@ -4,6 +4,12 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.4] — 25/10/2026
+
+- 📌 **Abertura discreta apenas na bandeja (System Tray):** ao abrir o aplicativo, ele inicia com o microfone desativado (ícone azul) e sem abrir a barra lateral na tela.
+
+---
+
 ## [v1.3.3] — 24/10/2026
 
 - 🚫 **Sem inicialização automática com o Windows:** removida a gravação automática no registro de inicialização (Run), abrindo o aplicativo somente quando o usuário desejar.
