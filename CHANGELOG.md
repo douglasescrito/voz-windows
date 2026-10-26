@@ -4,6 +4,13 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.10] — 26/10/2026
+
+- Reducao e calibragem fina da sensibilidade espacial do Mouse RT (desacoplado do ganho alto do 2o monitor e sem jitter de caixa do FaceDetector)
+- Prioridade total ao Touchpad por 260ms + rampa progressiva suave de 350ms + zona morta central auto-adaptativa para combinar facilmente Touch + Rosto
+
+---
+
 ## [v1.3.9] — 26/10/2026
 
 - Calibracao espacial hibrida combinando Touchpad + Head Realtime (ajustar com o touch reposiciona a ancora do RT e recalibra o centro espacial do rosto automaticamente)

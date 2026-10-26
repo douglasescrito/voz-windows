@@ -217,7 +217,7 @@ public sealed class CursorLoopSettings
             loaded.HeadRealtimeMouseEnabled = false;
             if (loaded.HeadRealtimeMouseSpeed <= 0.1)
             {
-                loaded.HeadRealtimeMouseSpeed = 4.2;
+                loaded.HeadRealtimeMouseSpeed = 1.2;
             }
             if (loaded.HeadConfigVersion < 2)
             {
@@ -231,6 +231,11 @@ public sealed class CursorLoopSettings
                 loaded.HeadLongDistanceHdMode = true;
                 loaded.HeadConfigVersion = 2;
             }
+            if (loaded.HeadConfigVersion < 3)
+            {
+                loaded.HeadRealtimeMouseSpeed = 1.2;
+                loaded.HeadConfigVersion = 3;
+            }
             loaded.Save();
             return loaded;
         }
@@ -241,7 +246,7 @@ public sealed class CursorLoopSettings
             RealtimeRewriteEnabled = false,
             HeadTrackerEnabled = false,
             HeadRealtimeMouseEnabled = false,
-            HeadRealtimeMouseSpeed = 4.2,
+            HeadRealtimeMouseSpeed = 1.2,
             HeadSensitivity = 2.4,
             HeadDistanceBoost = 2.0,
             HeadEnterThreshold = 0.080,
@@ -250,7 +255,7 @@ public sealed class CursorLoopSettings
             HeadConfirmFrames = 1,
             HeadReturnToPrimary = true,
             HeadLongDistanceHdMode = true,
-            HeadConfigVersion = 2,
+            HeadConfigVersion = 3,
             HorizontalLoop = true,
             VerticalLoop = true
         };
@@ -879,13 +884,20 @@ public sealed class HeadMonitorTracker : IDisposable
     private double _baselineAsym = 0.0;
     private bool _isCalibrated;
 
-    // Última posição conhecida da face para rastreio contínuo mesmo longe ou em perfil (>40°)
+    // Última posição conhecida da face (com filtro sub-pixel p/ eliminar salto de caixa do FaceDetector)
     private Rectangle _lastValidFaceBox;
+    private bool _hasSmoothBox;
+    private double _smoothBoxX;
+    private double _smoothBoxY;
+    private double _smoothBoxW;
+    private double _smoothBoxH;
     private long _lastValidFaceTick;
 
     // Filtro EMA + Histerese de transição + Mapeamento Espacial Híbrido (Touchpad + Rosto) para o Modo Realtime Mouse
     private double _smoothedYawRight;
     private double _smoothedPitchDown;
+    private double _rtSmoothYaw;
+    private double _rtSmoothPitch;
     private bool _hasRawFaceSample;
     private double _lastRawFaceX = 0.50;
     private double _lastRawFaceY = 0.50;
@@ -1059,8 +1071,11 @@ public sealed class HeadMonitorTracker : IDisposable
         _calibSumV = 0;
         _calibSumAsym = 0;
         _isCalibrated = false;
+        _hasSmoothBox = false;
         _smoothedYawRight = 0;
         _smoothedPitchDown = 0;
+        _rtSmoothYaw = 0;
+        _rtSmoothPitch = 0;
         _lastRawYawRight = 0;
         _lastRawPitchDown = 0;
         _rtAnchorInitialized = false;
@@ -1110,6 +1125,8 @@ public sealed class HeadMonitorTracker : IDisposable
             _lastRawPitchDown = 0;
             _smoothedYawRight = 0;
             _smoothedPitchDown = 0;
+            _rtSmoothYaw = 0;
+            _rtSmoothPitch = 0;
             _rtRefYaw = 0;
             _rtRefPitch = 0;
             _isCalibrated = true;
@@ -1126,8 +1143,8 @@ public sealed class HeadMonitorTracker : IDisposable
             // mas zera a referência espacial do Mouse RT exatamente na postura atual do 2º monitor!
             _smoothedYawRight = _lastRawYawRight;
             _smoothedPitchDown = _lastRawPitchDown;
-            _rtRefYaw = _lastRawYawRight;
-            _rtRefPitch = _lastRawPitchDown;
+            _rtRefYaw = _rtSmoothYaw;
+            _rtRefPitch = _rtSmoothPitch;
             _isLookingRight = true;
             _consecutiveRightFrames = 0;
             _consecutiveStraightFrames = 0;
@@ -1139,7 +1156,8 @@ public sealed class HeadMonitorTracker : IDisposable
     /// Chamado a 120 Hz pelo timer principal:
     /// - Se o usuário moveu o Touchpad/Mouse físico neste ciclo (userMovedTouchpad = true), usa a nova posição do Touchpad
     ///   para reposicionar a âncora espacial do RT e recalibrar o centro espacial do rosto sem esforço.
-    /// - Caso contrário, move o cursor espacialmente (1:1 suave) ao redor da âncora deixada pelo Touchpad.
+    /// - Caso contrário, aplica deslocamento espacial suave e proporcional (desacoplado do ganho alto do 2º monitor),
+    ///   com janela de prioridade total ao Touchpad (260ms) + rampa progressiva (350ms) para combinação suave.
     /// </summary>
     public void TickRealtimeCursor(bool userMovedTouchpad = false)
     {
@@ -1181,16 +1199,18 @@ public sealed class HeadMonitorTracker : IDisposable
             return;
         }
 
-        // Janela curta (55ms) após soltar o touchpad para garantir parada 100% limpa onde o dedo deixou o cursor
-        if (now - _lastTouchpadRecalibTick < 55)
+        long elapsedSinceTouch = now - _lastTouchpadRecalibTick;
+
+        // Prioridade total ao Touchpad por 260ms após cada toque: garante controle fino e cliques sem nenhuma briga com a câmera!
+        if (elapsedSinceTouch < 260)
         {
             try
             {
                 Point settlePos = Cursor.Position;
                 _rtAnchorX = settlePos.X;
                 _rtAnchorY = settlePos.Y;
-                _rtRefYaw = _smoothedYawRight;
-                _rtRefPitch = _smoothedPitchDown;
+                _rtRefYaw = _rtSmoothYaw;
+                _rtRefPitch = _rtSmoothPitch;
                 _rtCurrentOffsetX = 0;
                 _rtCurrentOffsetY = 0;
             }
@@ -1198,31 +1218,45 @@ public sealed class HeadMonitorTracker : IDisposable
             return;
         }
 
-        double deltaYaw = _smoothedYawRight - _rtRefYaw;
-        double deltaPitch = _smoothedPitchDown - _rtRefPitch;
+        double deltaYaw = _rtSmoothYaw - _rtRefYaw;
+        double deltaPitch = _rtSmoothPitch - _rtRefPitch;
+        double mag = Math.Sqrt(deltaYaw * deltaYaw + deltaPitch * deltaPitch);
 
-        double speedSetting = Math.Clamp(Settings?.HeadRealtimeMouseSpeed ?? 4.2, 0.5, 12.0);
+        // Zona morta central confortável (0.014): absorve respiração e micro-movimentos mantendo o cursor 100% parado onde o Touch deixou
+        const double deadzone = 0.014;
+        if (mag <= deadzone)
+        {
+            // Adapta suavemente a referência ao centro atual enquanto o rosto está parado na zona morta
+            _rtRefYaw = (0.985 * _rtRefYaw) + (0.015 * _rtSmoothYaw);
+            _rtRefPitch = (0.985 * _rtRefPitch) + (0.015 * _rtSmoothPitch);
+            return;
+        }
 
-        // Mapeamento Espacial Direto (Giro/Inclinação do Rosto -> Offset Espacial em Pixels a partir da Âncora do Touchpad)
+        // Rampa suave (350ms) após o término do uso do Touchpad para transição imperceptível entre Touch e Rosto
+        double postTouchRamp = Math.Clamp((elapsedSinceTouch - 260.0) / 350.0, 0.0, 1.0);
+        double speedSetting = Math.Clamp(Settings?.HeadRealtimeMouseSpeed ?? 1.2, 0.15, 6.0);
+
+        // Escala espacial controlada e proporcional (desacoplada do ganho do 2º monitor):
+        // Pequenos giros movem poucos pixels p/ ajuste fino; giros maiores movem 150~400px de forma fluida
         double absYaw = Math.Abs(deltaYaw);
-        double effYaw = Math.Max(0.0, absYaw - 0.0025);
-        double targetOffsetX = Math.Sign(deltaYaw) * (effYaw * 1650.0 + Math.Pow(effYaw, 1.42) * 3300.0) * speedSetting;
+        double effYaw = Math.Max(0.0, absYaw - deadzone * 0.85);
+        double targetOffsetX = Math.Sign(deltaYaw) * (effYaw * 540.0 + Math.Pow(effYaw, 1.55) * 1250.0) * speedSetting * postTouchRamp;
 
         double absPitch = Math.Abs(deltaPitch);
-        double effPitch = Math.Max(0.0, absPitch - 0.0025);
-        double targetOffsetY = Math.Sign(deltaPitch) * (effPitch * 1980.0 + Math.Pow(effPitch, 1.42) * 3700.0) * speedSetting;
+        double effPitch = Math.Max(0.0, absPitch - deadzone * 0.85);
+        double targetOffsetY = Math.Sign(deltaPitch) * (effPitch * 680.0 + Math.Pow(effPitch, 1.55) * 1450.0) * speedSetting * postTouchRamp;
 
         double diffX = targetOffsetX - _rtCurrentOffsetX;
         double diffY = targetOffsetY - _rtCurrentOffsetY;
         double dist = Math.Sqrt(diffX * diffX + diffY * diffY);
 
-        // Estabilização de mira (< 1.30 px) para manter o cursor firme na hora do clique
-        if (dist < 1.30)
+        // Estabilização de mira (< 1.50 px) para manter o cursor firme na hora do clique
+        if (dist < 1.50)
             return;
 
-        double lerp = dist < 10.0
-            ? 0.18
-            : Math.Clamp(0.22 + (dist / 160.0) * 0.22, 0.22, 0.46);
+        double lerp = dist < 12.0
+            ? 0.11
+            : Math.Clamp(0.14 + (dist / 220.0) * 0.14, 0.14, 0.28);
 
         _rtCurrentOffsetX += diffX * lerp;
         _rtCurrentOffsetY += diffY * lerp;
@@ -1420,19 +1454,43 @@ public sealed class HeadMonitorTracker : IDisposable
                     return;
                 }
 
-                double faceCenterNormX = (activeBox.X + 0.5 * activeBox.Width) / frameW;
-                double faceCenterNormY = (activeBox.Y + 0.5 * activeBox.Height) / frameH;
-                double faceWidthNorm = Math.Max(0.06, (double)activeBox.Width / frameW);
-                double faceHeightNorm = Math.Max(0.08, (double)activeBox.Height / frameH);
+                // Suavização sub-pixel da caixa da face para eliminar degraus inteiros do FaceDetector
+                if (!_hasSmoothBox)
+                {
+                    _smoothBoxX = activeBox.X;
+                    _smoothBoxY = activeBox.Y;
+                    _smoothBoxW = activeBox.Width;
+                    _smoothBoxH = activeBox.Height;
+                    _hasSmoothBox = true;
+                }
+                else
+                {
+                    const double boxAlpha = 0.32;
+                    _smoothBoxX = (boxAlpha * activeBox.X) + ((1.0 - boxAlpha) * _smoothBoxX);
+                    _smoothBoxY = (boxAlpha * activeBox.Y) + ((1.0 - boxAlpha) * _smoothBoxY);
+                    _smoothBoxW = (boxAlpha * activeBox.Width) + ((1.0 - boxAlpha) * _smoothBoxW);
+                    _smoothBoxH = (boxAlpha * activeBox.Height) + ((1.0 - boxAlpha) * _smoothBoxH);
+                }
+
+                Rectangle smoothRect = new(
+                    (int)Math.Round(_smoothBoxX),
+                    (int)Math.Round(_smoothBoxY),
+                    Math.Max(12, (int)Math.Round(_smoothBoxW)),
+                    Math.Max(12, (int)Math.Round(_smoothBoxH)));
+
+                double faceCenterNormX = (_smoothBoxX + 0.5 * _smoothBoxW) / frameW;
+                double faceCenterNormY = (_smoothBoxY + 0.5 * _smoothBoxH) / frameH;
+                double faceWidthNorm = Math.Max(0.08, _smoothBoxW / frameW);
+                double faceHeightNorm = Math.Max(0.10, _smoothBoxH / frameH);
 
                 var (featureCentroidU, featureCentroidV, cheekGradAsym) = ComputeInternalFaceYawFeatures(
                     _pixelBuffer,
                     frameW,
                     frameH,
-                    activeBox.X,
-                    activeBox.Y,
-                    activeBox.Width,
-                    activeBox.Height);
+                    smoothRect.X,
+                    smoothRect.Y,
+                    smoothRect.Width,
+                    smoothRect.Height);
 
                 _lastRawFaceX = faceCenterNormX;
                 _lastRawFaceY = faceCenterNormY;
@@ -1524,13 +1582,26 @@ public sealed class HeadMonitorTracker : IDisposable
                 _lastRawYawRight = rawYawRight;
                 _smoothedYawRight = (alpha * rawYawRight) + ((1.0 - alpha) * _smoothedYawRight);
 
-                // Inclinação vertical (Pitch Down = positivo / Up = negativo) para o Modo Função Realtime do Mouse
+                // Inclinação vertical (Pitch Down = positivo / Up = negativo)
                 double posShiftDown = (faceCenterNormY - _baselineY) / Math.Max(0.10, faceHeightNorm);
                 double featShiftDown = featureCentroidV - _baselineV;
                 double basePitchSignal = (0.85 * posShiftDown) + (3.60 * featShiftDown);
                 double rawPitchDown = basePitchSignal * (totalGain * 0.60);
                 _lastRawPitchDown = rawPitchDown;
                 _smoothedPitchDown = (alpha * rawPitchDown) + ((1.0 - alpha) * _smoothedPitchDown);
+
+                // Sinal Espacial Limpo e Desacoplado para o Mouse RT (cancela o jitter da caixa do FaceDetector usando coordenada global da feição!)
+                double globalFeatX = faceCenterNormX + (featureCentroidU - 0.5) * faceWidthNorm;
+                double baseGlobalFeatX = _baselineX + (_baselineU - 0.5) * faceWidthNorm;
+                double globalFeatY = faceCenterNormY + (featureCentroidV - 0.5) * faceHeightNorm;
+                double baseGlobalFeatY = _baselineY + (_baselineV - 0.5) * faceHeightNorm;
+
+                double rtRawYaw = ((baseGlobalFeatX - globalFeatX) / Math.Max(0.12, faceWidthNorm)) + (0.35 * featShiftRight);
+                double rtRawPitch = ((globalFeatY - baseGlobalFeatY) / Math.Max(0.12, faceHeightNorm)) + (0.35 * featShiftDown);
+
+                const double rtFilterAlpha = 0.24;
+                _rtSmoothYaw = (rtFilterAlpha * rtRawYaw) + ((1.0 - rtFilterAlpha) * _rtSmoothYaw);
+                _rtSmoothPitch = (rtFilterAlpha * rtRawPitch) + ((1.0 - rtFilterAlpha) * _rtSmoothPitch);
 
                 bool touchRecalibratedRecently = (now - _lastTouchpadRecalibTick) <= 650;
                 bool allowMonitorAutoWarp = (now - _lastTouchpadRecalibTick) > 450;
@@ -1834,8 +1905,8 @@ public sealed class HeadMonitorTracker : IDisposable
                 _rtAnchorInitialized = true;
                 _rtAnchorX = center.X;
                 _rtAnchorY = center.Y;
-                _rtRefYaw = _smoothedYawRight;
-                _rtRefPitch = _smoothedPitchDown;
+                _rtRefYaw = _rtSmoothYaw;
+                _rtRefPitch = _rtSmoothPitch;
                 _rtCurrentOffsetX = 0;
                 _rtCurrentOffsetY = 0;
                 _lastWarpTick = now;
@@ -2183,8 +2254,8 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
 
         (_realtimeSpeedSlider, _realtimeSpeedValueText) = AddSliderRow(
             slidersStack,
-            "5. Velocidade do Cursor no Modo Função Realtime (Controlar o mouse continuamente com o rosto):",
-            1.0, 10.0, _settings.HeadRealtimeMouseSpeed, "0.0x",
+            "5. Sensibilidade Espacial do Mouse RT (Mais baixo = mais suave e fácil de combinar com o Touch):",
+            0.2, 4.0, _settings.HeadRealtimeMouseSpeed, "0.0x",
             val =>
             {
                 _settings.HeadRealtimeMouseSpeed = Math.Round(val, 1);
