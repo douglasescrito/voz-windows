@@ -1,4 +1,7 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -27,6 +30,22 @@ public sealed class RewriteDeckView : Border
     private readonly Grid _cardsGrid;
     private readonly Border _nativeModePanel;
     private readonly TextBlock _nativeLivePreviewBox;
+    private readonly TextBlock _currentTopicBadgeText;
+    private readonly TextBlock _timelineCountText;
+    private readonly Button _btnCopyTimeline;
+    private readonly ScrollViewer _timelineScrollViewer;
+    private readonly StackPanel _timelineItemsStack;
+    private readonly Border _timelineEmptyPlaceholder;
+
+    private sealed record TimelineCardRefs(
+        Border CardBorder,
+        TextBlock MetaText,
+        TextBlock BadgeText,
+        TextBlock ThemeTitleText,
+        TextBlock BulletsBodyText);
+
+    private readonly Dictionary<long, TimelineCardRefs> _timelineCards = new();
+    private readonly List<TimelineLogEntry> _timelineHistory = new();
     private readonly Border[] _cardBorders = new Border[OptionCount];
     private readonly Border[] _cardCheckBorders = new Border[OptionCount];
     private readonly TextBlock[] _cardCheckIcons = new TextBlock[OptionCount];
@@ -200,13 +219,14 @@ public sealed class RewriteDeckView : Border
             OnOptionClicked?.Invoke(_rawOriginal, "Original");
         };
 
-        var btnReset = CreateHeaderButton("🔄 Limpar", "Zerar o texto acumulado para começar outra mensagem do zero");
+        var btnReset = CreateHeaderButton("🔄 Limpar", "Zerar o texto acumulado e limpar a Linha do Tempo para começar do zero");
         btnReset.Click += (_, _) =>
         {
+            ClearTimelineLog();
             OnResetBlockRequested?.Invoke();
             _headerStatusText.Text = _realtimeRewriteEnabled
                 ? "✨ BLOCO ZERADO • Fale a nova mensagem para gerar as 6 variações"
-                : "⚡ BLOCO ZERADO • Modo Nativo Direto pronto para nova fala";
+                : "📋 LINHA DO TEMPO LIMPA • Pronta para captar novos assuntos em tempo real";
             _headerStatusText.Foreground = BrushAccentSilver;
         };
 
@@ -230,35 +250,43 @@ public sealed class RewriteDeckView : Border
         Grid.SetRow(headerStack, 0);
         rootGrid.Children.Add(headerStack);
 
-        // Panel 1: Native Direct Mode View (shown when RealtimeRewriteEnabled == false)
+        // Panel 1: Realtime Thematic Timeline + Native Live Mode (shown when RealtimeRewriteEnabled == false)
         _nativeModePanel = new Border
         {
             CornerRadius = new CornerRadius(10),
             Background = BrushNativePanelBg,
             BorderBrush = BrushNativePanelBorder,
             BorderThickness = new Thickness(1.2),
-            Padding = new Thickness(14, 14, 14, 14),
+            Padding = new Thickness(10, 10, 10, 10),
             Margin = new Thickness(0, 2, 2, 0),
-            VerticalAlignment = VerticalAlignment.Top
+            VerticalAlignment = VerticalAlignment.Stretch
         };
 
-        var nativeStack = new StackPanel();
-        var nativeBadge = new TextBlock
+        var nativeGrid = new Grid { ClipToBounds = true };
+        nativeGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Row 0: Assunto Atual + Captura ao Vivo
+        nativeGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Row 1: Cabeçalho da Linha do Tempo + Botões
+        nativeGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // Row 2: ScrollViewer da Linha do Tempo Contínua
+
+        var topLiveStack = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
+
+        var currentTopicBanner = new Border
         {
-            Text = "⚡ MODO NATIVO DIRETO (ALTA PERFORMANCE)",
+            CornerRadius = new CornerRadius(7),
+            Background = CreateFrozen(16, 32, 44),
+            BorderBrush = CreateFrozen(14, 116, 144),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(9, 6, 9, 6),
+            Margin = new Thickness(0, 0, 0, 6)
+        };
+        _currentTopicBadgeText = new TextBlock
+        {
+            Text = "🎯 ASSUNTO ATUAL: Aguardando fala (F8) ou áudio do PC (🎧)...",
             FontSize = 11.5,
             FontWeight = FontWeights.Bold,
             Foreground = BrushSkyAccent,
-            Margin = new Thickness(0, 0, 0, 6)
+            TextWrapping = TextWrapping.Wrap
         };
-        var nativeDesc = new TextBlock
-        {
-            Text = "As palavras são digitadas diretamente no cursor assim que você fala, sem gastar processamento com correções ou geração das 6 opções de escrita.",
-            FontSize = 11.5,
-            Foreground = BrushMutedText,
-            TextWrapping = TextWrapping.Wrap,
-            Margin = new Thickness(0, 0, 0, 10)
-        };
+        currentTopicBanner.Child = _currentTopicBadgeText;
 
         var previewCard = new Border
         {
@@ -266,39 +294,107 @@ public sealed class RewriteDeckView : Border
             Background = BrushCardBg,
             BorderBrush = BrushCardBorder,
             BorderThickness = new Thickness(1),
-            Padding = new Thickness(10, 8, 10, 8),
-            Margin = new Thickness(0, 0, 0, 10)
+            Padding = new Thickness(9, 6, 9, 6)
         };
         _nativeLivePreviewBox = new TextBlock
         {
-            Text = "Fale normalmente (F8) para digitar direto no cursor...",
-            FontSize = 12.5,
+            Text = "🗣️ Captura em tempo real: fale no microfone (F8) ou ative '🎧 Ouvir PC' para resumir continuamente em tópicos...",
+            FontSize = 11.5,
             FontWeight = FontWeights.Medium,
-            Foreground = BrushBrightText,
+            Foreground = BrushMutedText,
             TextWrapping = TextWrapping.Wrap,
-            MaxHeight = 260,
+            MaxHeight = 68,
             TextTrimming = TextTrimming.CharacterEllipsis
         };
         previewCard.Child = _nativeLivePreviewBox;
 
+        topLiveStack.Children.Add(currentTopicBanner);
+        topLiveStack.Children.Add(previewCard);
+        Grid.SetRow(topLiveStack, 0);
+        nativeGrid.Children.Add(topLiveStack);
+
+        // Row 1: Timeline Toolbar
+        var timelineToolbar = new Grid { Margin = new Thickness(0, 0, 0, 6) };
+        timelineToolbar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        timelineToolbar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        _timelineCountText = new TextBlock
+        {
+            Text = "📋 LINHA DO TEMPO DE ASSUNTOS (0)",
+            FontSize = 11,
+            FontWeight = FontWeights.Bold,
+            Foreground = BrushAccentBrightGreen,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        Grid.SetColumn(_timelineCountText, 0);
+        timelineToolbar.Children.Add(_timelineCountText);
+
+        var timelineActionsRow = new StackPanel { Orientation = Orientation.Horizontal };
+        _btnCopyTimeline = CreateHeaderButton(
+            "📋 Copiar Log",
+            "Copiar toda a Linha do Tempo de Assuntos e Tópicos para a Área de Transferência");
+        _btnCopyTimeline.Background = CreateFrozen(20, 42, 32);
+        _btnCopyTimeline.Foreground = BrushAccentBrightGreen;
+        _btnCopyTimeline.Padding = new Thickness(8, 4, 8, 4);
+        _btnCopyTimeline.Margin = new Thickness(0, 0, 4, 0);
+        _btnCopyTimeline.Click += (_, _) => CopyEntireTimelineToClipboard();
+
         var btnEnableSixOptions = CreateHeaderButton(
-            "✨ Ativar 6 Opções de Escrita (IA)",
-            "Habilitar novamente o painel com as 6 variações de reescrita quando precisar");
+            "✨ 6 Estilos",
+            "Alternar para o gerador das 6 opções de escrita no mesmo espaço");
         btnEnableSixOptions.Background = CreateFrozen(28, 36, 52);
         btnEnableSixOptions.Foreground = BrushBrightText;
-        btnEnableSixOptions.Padding = new Thickness(12, 7, 12, 7);
+        btnEnableSixOptions.Padding = new Thickness(8, 4, 8, 4);
         btnEnableSixOptions.Margin = new Thickness(0);
-        btnEnableSixOptions.HorizontalAlignment = HorizontalAlignment.Left;
         btnEnableSixOptions.Click += (_, _) =>
         {
             OnToggleRewriteModeRequested?.Invoke();
         };
 
-        nativeStack.Children.Add(nativeBadge);
-        nativeStack.Children.Add(nativeDesc);
-        nativeStack.Children.Add(previewCard);
-        nativeStack.Children.Add(btnEnableSixOptions);
-        _nativeModePanel.Child = nativeStack;
+        timelineActionsRow.Children.Add(_btnCopyTimeline);
+        timelineActionsRow.Children.Add(btnEnableSixOptions);
+        Grid.SetColumn(timelineActionsRow, 1);
+        timelineToolbar.Children.Add(timelineActionsRow);
+
+        Grid.SetRow(timelineToolbar, 1);
+        nativeGrid.Children.Add(timelineToolbar);
+
+        // Row 2: Continuous Scrolling Timeline Log
+        _timelineScrollViewer = new ScrollViewer
+        {
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Padding = new Thickness(0, 0, 2, 0)
+        };
+
+        _timelineItemsStack = new StackPanel();
+
+        _timelineEmptyPlaceholder = new Border
+        {
+            CornerRadius = new CornerRadius(8),
+            Background = BrushCardBg,
+            BorderBrush = BrushCardBorder,
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(12, 12, 12, 12),
+            Margin = new Thickness(0, 2, 0, 4)
+        };
+        var emptyText = new TextBlock
+        {
+            Text = "🕒 Log contínuo em tempo real:\n• Conforme você fala (🎙️ F8) ou escuta o computador (🎧 Ouvir PC), cada assunto é resumido em tópicos com horário.\n• Os novos blocos entram abaixo e a linha do tempo vai subindo automaticamente.\n• Clique em qualquer card para copiar o resumo daquele assunto.",
+            FontSize = 11.2,
+            Foreground = BrushMutedText,
+            TextWrapping = TextWrapping.Wrap,
+            LineHeight = 17
+        };
+        _timelineEmptyPlaceholder.Child = emptyText;
+        _timelineItemsStack.Children.Add(_timelineEmptyPlaceholder);
+
+        _timelineScrollViewer.Content = _timelineItemsStack;
+        Grid.SetRow(_timelineScrollViewer, 2);
+        nativeGrid.Children.Add(_timelineScrollViewer);
+
+        _nativeModePanel.Child = nativeGrid;
 
         // Panel 2: Fixed 6-Row Proportional Grid (shown when RealtimeRewriteEnabled == true)
         _cardsGrid = new Grid
@@ -503,10 +599,10 @@ public sealed class RewriteDeckView : Border
             _btnOriginal.Visibility = Visibility.Collapsed;
             _btnRestorePrevious.Visibility = Visibility.Collapsed;
 
-            _slotTitleText.Text = $"⚡ VOZ NATIVA • v{AutoUpdateService.CurrentVersionString}";
-            _btnToggleModeHeader.Content = "⚡ Só Nativo";
+            _slotTitleText.Text = $"📋 RESUMO TIMELINE • v{AutoUpdateService.CurrentVersionString}";
+            _btnToggleModeHeader.Content = "📋 Resumo Live";
             _btnToggleModeHeader.Foreground = BrushSkyAccent;
-            _headerStatusText.Text = "⚡ Modo Nativo Direto ativo • Sem reescrita e sem 6 opções (máxima velocidade)";
+            _headerStatusText.Text = "📋 Linha do Tempo em Tópicos ativa • Resumo contínuo em tempo real (Mic & Ouvir PC)";
             _headerStatusText.Foreground = BrushSkyAccent;
         }
         else
@@ -530,14 +626,240 @@ public sealed class RewriteDeckView : Border
     {
         if (string.IsNullOrWhiteSpace(text))
         {
-            _nativeLivePreviewBox.Text = "Fale normalmente (F8) para digitar direto no cursor...";
+            _nativeLivePreviewBox.Text = "🗣️ Captura em tempo real: fale no microfone (F8) ou ative '🎧 Ouvir PC' para resumir continuamente em tópicos...";
             _nativeLivePreviewBox.Foreground = BrushMutedText;
             return;
         }
 
-        string tail = FormatRollingTailForCard(text, 280);
+        string tail = FormatRollingTailForCard(text, 220);
         _nativeLivePreviewBox.Text = (isFinal ? "✓ " : "🗣️ ") + tail;
         _nativeLivePreviewBox.Foreground = isFinal ? BrushBrightText : BrushSkyAccent;
+    }
+
+    public void UpdateLiveTopicPreview(string themeTitle, string liveSnippet)
+    {
+        if (!string.IsNullOrWhiteSpace(themeTitle))
+        {
+            _currentTopicBadgeText.Text = $"🎯 ASSUNTO ATUAL: {themeTitle}";
+            _currentTopicBadgeText.Foreground = BrushAccentBrightGreen;
+        }
+        if (!string.IsNullOrWhiteSpace(liveSnippet))
+        {
+            UpdateNativeLivePreview(liveSnippet, isFinal: false);
+        }
+    }
+
+    public void AddOrUpdateTimelineEntry(TimelineLogEntry entry, bool isNewEntry)
+    {
+        _timelineEmptyPlaceholder.Visibility = Visibility.Collapsed;
+        _currentTopicBadgeText.Text = $"🎯 ASSUNTO ATUAL: {entry.TopicTitle}";
+        _currentTopicBadgeText.Foreground = entry.IsAiRefined ? BrushAccentBrightGreen : BrushSkyAccent;
+
+        int existingHistIdx = _timelineHistory.FindIndex(x => x.Id == entry.Id);
+        if (existingHistIdx >= 0)
+        {
+            _timelineHistory[existingHistIdx] = entry;
+        }
+        else
+        {
+            _timelineHistory.Add(entry);
+        }
+
+        _timelineCountText.Text = $"📋 LINHA DO TEMPO DE ASSUNTOS ({_timelineHistory.Count})";
+
+        string sourceLabel = entry.IsPcAudio ? "🎧 PC" : "🎙️ MIC";
+        string metaLabel = $"🕒 {entry.Timestamp}  •  {sourceLabel}";
+        string badgeLabel = entry.IsAiRefined ? "✨ Resumido • Copiar" : "⚡ Resumindo...";
+        string themeLabel = $"📌 {entry.TopicTitle}";
+        string bulletsText = FormatTimelineBullets(entry.Bullets);
+
+        if (_timelineCards.TryGetValue(entry.Id, out var existingCard))
+        {
+            existingCard.MetaText.Text = metaLabel;
+            existingCard.BadgeText.Text = badgeLabel;
+            existingCard.BadgeText.Foreground = entry.IsAiRefined ? BrushAccentBrightGreen : BrushAmberLoading;
+            existingCard.ThemeTitleText.Text = themeLabel;
+            existingCard.ThemeTitleText.Foreground = entry.IsAiRefined ? BrushAccentBrightGreen : BrushSkyAccent;
+            existingCard.BulletsBodyText.Text = bulletsText;
+            existingCard.CardBorder.Background = entry.IsAiRefined ? BrushCardConvertedBg : BrushCardBg;
+            existingCard.CardBorder.BorderBrush = entry.IsAiRefined ? BrushCardConvertedBorder : BrushCardBorder;
+            existingCard.CardBorder.Tag = entry;
+            _timelineScrollViewer.ScrollToEnd();
+            return;
+        }
+
+        var cardBorder = new Border
+        {
+            CornerRadius = new CornerRadius(8),
+            Background = entry.IsAiRefined ? BrushCardConvertedBg : BrushCardBg,
+            BorderBrush = entry.IsAiRefined ? BrushCardConvertedBorder : BrushCardBorder,
+            BorderThickness = new Thickness(1.2),
+            Padding = new Thickness(10, 7, 10, 7),
+            Margin = new Thickness(0, 0, 0, 6),
+            Cursor = Cursors.Hand,
+            ToolTip = "Clique para copiar este resumo temático para a Área de Transferência",
+            Tag = entry
+        };
+
+        var cardStack = new StackPanel();
+
+        var topMetaRow = new Grid { Margin = new Thickness(0, 0, 0, 3) };
+        topMetaRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        topMetaRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+        var metaText = new TextBlock
+        {
+            Text = metaLabel,
+            FontSize = 10,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = BrushMutedText,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        Grid.SetColumn(metaText, 0);
+        topMetaRow.Children.Add(metaText);
+
+        var badgeText = new TextBlock
+        {
+            Text = badgeLabel,
+            FontSize = 9.5,
+            FontWeight = FontWeights.Bold,
+            Foreground = entry.IsAiRefined ? BrushAccentBrightGreen : BrushAmberLoading,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        Grid.SetColumn(badgeText, 1);
+        topMetaRow.Children.Add(badgeText);
+
+        var themeTitleText = new TextBlock
+        {
+            Text = themeLabel,
+            FontSize = 12,
+            FontWeight = FontWeights.Bold,
+            Foreground = entry.IsAiRefined ? BrushAccentBrightGreen : BrushSkyAccent,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 3)
+        };
+
+        var bulletsBodyText = new TextBlock
+        {
+            Text = bulletsText,
+            FontSize = 11.5,
+            FontWeight = FontWeights.Medium,
+            Foreground = BrushBrightText,
+            TextWrapping = TextWrapping.Wrap,
+            LineHeight = 16
+        };
+
+        cardStack.Children.Add(topMetaRow);
+        cardStack.Children.Add(themeTitleText);
+        cardStack.Children.Add(bulletsBodyText);
+        cardBorder.Child = cardStack;
+
+        cardBorder.MouseEnter += (_, _) =>
+        {
+            cardBorder.Background = BrushCardHoverBg;
+            cardBorder.BorderBrush = BrushCardHoverBorder;
+        };
+        cardBorder.MouseLeave += (_, _) =>
+        {
+            if (cardBorder.Tag is TimelineLogEntry cur)
+            {
+                cardBorder.Background = cur.IsAiRefined ? BrushCardConvertedBg : BrushCardBg;
+                cardBorder.BorderBrush = cur.IsAiRefined ? BrushCardConvertedBorder : BrushCardBorder;
+            }
+        };
+        cardBorder.PreviewMouseLeftButtonDown += (_, e) =>
+        {
+            e.Handled = true;
+            if (cardBorder.Tag is TimelineLogEntry cur)
+            {
+                try
+                {
+                    string formatted = $"[{cur.Timestamp}] 📌 {cur.TopicTitle}\n{FormatTimelineBullets(cur.Bullets)}";
+                    Clipboard.SetText(formatted);
+                    badgeText.Text = "☑ Copiado!";
+                    badgeText.Foreground = BrushAccentBrightGreen;
+                    _headerStatusText.Text = $"📋 Tópico \"{cur.TopicTitle}\" copiado para a Área de Transferência!";
+                    _headerStatusText.Foreground = BrushAccentBrightGreen;
+                }
+                catch { }
+            }
+        };
+
+        _timelineCards[entry.Id] = new TimelineCardRefs(cardBorder, metaText, badgeText, themeTitleText, bulletsBodyText);
+        _timelineItemsStack.Children.Add(cardBorder);
+
+        // Mantém os últimos 120 cards em memória visual para fluidez infinita
+        if (_timelineItemsStack.Children.Count > 125)
+        {
+            for (int idx = 0; idx < _timelineItemsStack.Children.Count; idx++)
+            {
+                if (_timelineItemsStack.Children[idx] is Border oldBorder &&
+                    !ReferenceEquals(oldBorder, _timelineEmptyPlaceholder))
+                {
+                    if (oldBorder.Tag is TimelineLogEntry oldEntry)
+                    {
+                        _timelineCards.Remove(oldEntry.Id);
+                    }
+                    _timelineItemsStack.Children.RemoveAt(idx);
+                    break;
+                }
+            }
+        }
+
+        _timelineScrollViewer.UpdateLayout();
+        _timelineScrollViewer.ScrollToEnd();
+    }
+
+    public void ClearTimelineLog()
+    {
+        _timelineCards.Clear();
+        _timelineHistory.Clear();
+        _timelineItemsStack.Children.Clear();
+        _timelineEmptyPlaceholder.Visibility = Visibility.Visible;
+        _timelineItemsStack.Children.Add(_timelineEmptyPlaceholder);
+        _timelineCountText.Text = "📋 LINHA DO TEMPO DE ASSUNTOS (0)";
+        _currentTopicBadgeText.Text = "🎯 ASSUNTO ATUAL: Aguardando fala (F8) ou áudio do PC (🎧)...";
+        _currentTopicBadgeText.Foreground = BrushSkyAccent;
+    }
+
+    private void CopyEntireTimelineToClipboard()
+    {
+        if (_timelineHistory.Count == 0)
+        {
+            _headerStatusText.Text = "⚠️ A Linha do Tempo ainda está vazia — fale (F8) ou ative '🎧 Ouvir PC'";
+            _headerStatusText.Foreground = BrushAmberLoading;
+            return;
+        }
+
+        try
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine($"=== LINHA DO TEMPO DE ASSUNTOS ({DateTime.Now:dd/MM/yyyy HH:mm}) ===");
+            sb.AppendLine();
+            foreach (var item in _timelineHistory)
+            {
+                string src = item.IsPcAudio ? "PC" : "MIC";
+                sb.AppendLine($"[{item.Timestamp} • {src}] 📌 {item.TopicTitle}");
+                foreach (string b in item.Bullets)
+                {
+                    sb.AppendLine($"  • {b}");
+                }
+                sb.AppendLine();
+            }
+
+            Clipboard.SetText(sb.ToString().TrimEnd());
+            _btnCopyTimeline.Content = "☑ Log Copiado!";
+            _headerStatusText.Text = $"📋 Linha do Tempo completa ({_timelineHistory.Count} assuntos) copiada!";
+            _headerStatusText.Foreground = BrushAccentBrightGreen;
+        }
+        catch { }
+    }
+
+    private static string FormatTimelineBullets(string[]? bullets)
+    {
+        if (bullets == null || bullets.Length == 0)
+            return "• Processando resumo do tópico...";
+        return string.Join("\n", bullets.Where(b => !string.IsNullOrWhiteSpace(b)).Select(b => "• " + b.Trim()));
     }
 
     public void SetConvertingLiveState(int currentCharCount = 0, string? activeSpokenText = null)

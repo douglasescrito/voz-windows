@@ -97,7 +97,7 @@ public sealed class CursorLoopSettings
 
     public string GetRewriteModePillText()
     {
-        return RealtimeRewriteEnabled ? "✨ 6 Opções: ON" : "⚡ Só Nativo";
+        return RealtimeRewriteEnabled ? "✨ 6 Opções: ON" : "📋 Resumo Live";
     }
 
     public string GetHeadTrackerPillText()

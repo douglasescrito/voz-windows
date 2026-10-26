@@ -22,6 +22,15 @@ public sealed record RewriteVariations(
     string PersuasivaConfiante,
     bool IsAiRefined);
 
+public sealed record TimelineLogEntry(
+    long Id,
+    string Timestamp,
+    bool IsPcAudio,
+    string TopicTitle,
+    string[] Bullets,
+    string RawText,
+    bool IsAiRefined);
+
 public sealed class GeminiRewriteClient : IDisposable
 {
     private const int MaxActiveRewriteTailChars = 520;
@@ -53,7 +62,18 @@ public sealed class GeminiRewriteClient : IDisposable
     private string _lastRefinedTailRaw = string.Empty;
     private RewriteVariations? _lastRefinedTailResult;
 
+    // Realtime Thematic Timeline Summarizer state (works for both 🎧 Ouvir PC and 🎙️ Mic F8)
+    private readonly object _timelineLock = new();
+    private long _nextTimelineId;
+    private int _timelineConsumedLen;
+    private string _activeTurnBuffer = string.Empty;
+    private string _lastEmittedSegmentNorm = string.Empty;
+    private DateTime _lastEmittedUtc = DateTime.MinValue;
+    private string _lastKnownThemeTitle = string.Empty;
+
     public event Action<RewriteVariations>? OnVariationsUpdated;
+    public event Action<TimelineLogEntry, bool>? OnTimelineEntryUpdated;
+    public event Action<string, string>? OnCurrentLiveTopicPreview;
 
     public void ResetMemoryCache()
     {
@@ -747,6 +767,364 @@ public sealed class GeminiRewriteClient : IDisposable
             }
         }
         return count;
+    }
+
+    // ========================================================================
+    // RESUMIDOR TEMÁTICO EM TEMPO REAL — LINHA DO TEMPO CONTÍNUA (MIC & PC)
+    // ========================================================================
+
+    public void ResetTimelineTurnState()
+    {
+        lock (_timelineLock)
+        {
+            _timelineConsumedLen = 0;
+            _activeTurnBuffer = string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Alimenta o resumidor de Linha do Tempo em tempo real (tanto no modo 🎧 Ouvir PC quanto no 🎙️ Microfone).
+    /// - Atualiza instantaneamente o indicador de "Assunto Atual em Andamento".
+    /// - Quando a fala contínua atinge ~135 caracteres (ex.: transmissão de TV, vídeo ou reunião sem pausas)
+    ///   OU quando uma frase/pausa conclui (isFinalTurn = true), fatia o trecho, cria imediatamente o card
+    ///   na Linha do Tempo e refina o Título do Assunto + Tópicos via Gemini em segundo plano (~600ms).
+    /// </summary>
+    public void FeedLiveSpeechForTimeline(string apiKey, string currentTurnText, bool isFinalTurn, bool isPcAudio)
+    {
+        string raw = (currentTurnText ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(raw))
+            return;
+
+        List<string> segmentsToEmit = new();
+        string liveRemainder = string.Empty;
+
+        lock (_timelineLock)
+        {
+            // Se o texto recebido é menor que o já consumido (ou mudou de turno), recomeça o cursor do turno atual
+            if (raw.Length < _timelineConsumedLen ||
+                (_timelineConsumedLen > 0 && !raw.StartsWith(_activeTurnBuffer[..Math.Min(_activeTurnBuffer.Length, _timelineConsumedLen)], StringComparison.OrdinalIgnoreCase)))
+            {
+                _timelineConsumedLen = 0;
+            }
+
+            _activeTurnBuffer = raw;
+            string unconsumed = _timelineConsumedLen < raw.Length
+                ? raw[_timelineConsumedLen..].TrimStart()
+                : string.Empty;
+
+            if (!isFinalTurn)
+            {
+                // Enquanto fala continuamente (ex: 🎧 Ouvir PC em vídeos/jornais/reuniões), fatia a cada ~140 chars num limite natural
+                while (unconsumed.Length >= 145)
+                {
+                    int splitPos = FindNaturalTimelineSplit(unconsumed, minChars: 105, maxChars: 165);
+                    if (splitPos <= 0)
+                        break;
+
+                    string chunk = unconsumed[..splitPos].Trim();
+                    int consumedAdvance = raw.Length - unconsumed.Length + splitPos;
+                    _timelineConsumedLen = Math.Clamp(consumedAdvance, 0, raw.Length);
+                    unconsumed = _timelineConsumedLen < raw.Length
+                        ? raw[_timelineConsumedLen..].TrimStart()
+                        : string.Empty;
+
+                    if (CountWords(chunk) >= 4)
+                    {
+                        segmentsToEmit.Add(chunk);
+                    }
+                }
+                liveRemainder = unconsumed;
+            }
+            else
+            {
+                // Fechamento de frase ou pausa (isFinalTurn): emite o trecho restante se tiver conteúdo relevante
+                if (CountWords(unconsumed) >= 3 && unconsumed.Length >= 14)
+                {
+                    segmentsToEmit.Add(unconsumed.Trim());
+                }
+                _timelineConsumedLen = 0;
+                _activeTurnBuffer = string.Empty;
+                liveRemainder = string.Empty;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(liveRemainder))
+        {
+            string quickTheme = ExtractQuickLocalTheme(liveRemainder, _lastKnownThemeTitle);
+            OnCurrentLiveTopicPreview?.Invoke(quickTheme, liveRemainder);
+        }
+
+        foreach (string seg in segmentsToEmit)
+        {
+            EmitAndRefineTimelineSegment(apiKey, seg, isPcAudio);
+        }
+    }
+
+    public void FlushPendingTimelineSegment(string apiKey, bool isPcAudio)
+    {
+        string pending = string.Empty;
+        lock (_timelineLock)
+        {
+            if (!string.IsNullOrWhiteSpace(_activeTurnBuffer) && _timelineConsumedLen < _activeTurnBuffer.Length)
+            {
+                pending = _activeTurnBuffer[_timelineConsumedLen..].Trim();
+            }
+            _timelineConsumedLen = 0;
+            _activeTurnBuffer = string.Empty;
+        }
+
+        if (CountWords(pending) >= 3 && pending.Length >= 14)
+        {
+            EmitAndRefineTimelineSegment(apiKey, pending, isPcAudio);
+        }
+    }
+
+    private static int FindNaturalTimelineSplit(string text, int minChars, int maxChars)
+    {
+        int limit = Math.Min(text.Length, maxChars);
+        // 1. Prioriza fim de frase (. ! ? ;)
+        for (int i = limit - 1; i >= minChars; i--)
+        {
+            char c = text[i];
+            if (c is '.' or '!' or '?' or ';')
+                return i + 1;
+        }
+        // 2. Vírgula ou conjunção
+        for (int i = limit - 1; i >= minChars; i--)
+        {
+            if (text[i] == ',')
+                return i + 1;
+        }
+        // 3. Espaço entre palavras
+        for (int i = limit - 1; i >= minChars; i--)
+        {
+            if (char.IsWhiteSpace(text[i]))
+                return i + 1;
+        }
+        return limit;
+    }
+
+    private void EmitAndRefineTimelineSegment(string apiKey, string rawSegment, bool isPcAudio)
+    {
+        string cleanSeg = CleanSpokenPortugueseLocally(rawSegment);
+        if (string.IsNullOrWhiteSpace(cleanSeg))
+            return;
+
+        string norm = NormalizeForComparison(cleanSeg);
+        TimelineLogEntry initialEntry;
+
+        lock (_timelineLock)
+        {
+            if (!string.IsNullOrEmpty(_lastEmittedSegmentNorm) &&
+                (DateTime.UtcNow - _lastEmittedUtc).TotalSeconds < 8.0 &&
+                (string.Equals(norm, _lastEmittedSegmentNorm, StringComparison.OrdinalIgnoreCase) ||
+                 _lastEmittedSegmentNorm.EndsWith(norm, StringComparison.OrdinalIgnoreCase)))
+            {
+                return;
+            }
+
+            _lastEmittedSegmentNorm = norm;
+            _lastEmittedUtc = DateTime.UtcNow;
+
+            long id = ++_nextTimelineId;
+            string timestamp = DateTime.Now.ToString("HH:mm:ss");
+            string localTheme = ExtractQuickLocalTheme(cleanSeg, _lastKnownThemeTitle);
+            string[] localBullets = BuildQuickLocalBullets(cleanSeg);
+            _lastKnownThemeTitle = localTheme;
+
+            initialEntry = new TimelineLogEntry(
+                Id: id,
+                Timestamp: timestamp,
+                IsPcAudio: isPcAudio,
+                TopicTitle: localTheme,
+                Bullets: localBullets,
+                RawText: cleanSeg,
+                IsAiRefined: false);
+        }
+
+        OnTimelineEntryUpdated?.Invoke(initialEntry, true);
+        OnCurrentLiveTopicPreview?.Invoke(initialEntry.TopicTitle, cleanSeg);
+
+        if (string.IsNullOrWhiteSpace(apiKey) || CountWords(cleanSeg) < 4)
+        {
+            var markedReady = initialEntry with { IsAiRefined = true };
+            OnTimelineEntryUpdated?.Invoke(markedReady, false);
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var aiSummary = await FetchGeminiTimelineSummaryAsync(apiKey.Trim(), cleanSeg, _lastKnownThemeTitle);
+                if (aiSummary != null)
+                {
+                    lock (_timelineLock)
+                    {
+                        _lastKnownThemeTitle = aiSummary.Value.Theme;
+                    }
+                    var refined = initialEntry with
+                    {
+                        TopicTitle = aiSummary.Value.Theme,
+                        Bullets = aiSummary.Value.Bullets,
+                        IsAiRefined = true
+                    };
+                    OnTimelineEntryUpdated?.Invoke(refined, false);
+                    OnCurrentLiveTopicPreview?.Invoke(refined.TopicTitle, cleanSeg);
+                }
+                else
+                {
+                    OnTimelineEntryUpdated?.Invoke(initialEntry with { IsAiRefined = true }, false);
+                }
+            }
+            catch
+            {
+                OnTimelineEntryUpdated?.Invoke(initialEntry with { IsAiRefined = true }, false);
+            }
+        });
+    }
+
+    private static async Task<(string Theme, string[] Bullets)?> FetchGeminiTimelineSummaryAsync(
+        string apiKey,
+        string cleanSegment,
+        string previousTheme)
+    {
+        string contextLine = string.IsNullOrWhiteSpace(previousTheme)
+            ? string.Empty
+            : $"Assunto imediatamente anterior (para continuidade): \"{previousTheme}\"\n";
+
+        string prompt =
+            "Você é um resumidor temático em tempo real para uma Linha do Tempo de Assuntos.\n" +
+            contextLine +
+            "Analise o trecho de fala/áudio abaixo e sintetize:\n" +
+            "1) \"tema\": Título curto, claro e específico do assunto atual (3 a 6 palavras, sem ponto final).\n" +
+            "2) \"topicos\": Lista com 1 ou 2 frases curtas e diretas resumindo a informação principal (sem repetir o título).\n\n" +
+            "Trecho:\n\"\"\"\n" + cleanSegment + "\n\"\"\"\n\n" +
+            "Retorne APENAS JSON: {\"tema\":\"...\",\"topicos\":[\"...\"]}";
+
+        (string Model, bool UseBudgetZero, int TimeoutMs)[] candidates =
+        {
+            ("gemini-2.5-flash", true, 2600),
+            ("gemini-3-flash-preview", false, 3000)
+        };
+
+        foreach (var c in candidates)
+        {
+            if (ModelCooldownUntilUtc.TryGetValue(c.Model, out DateTime until) && DateTime.UtcNow < until)
+                continue;
+
+            try
+            {
+                using var cts = new CancellationTokenSource(c.TimeoutMs);
+                string url = $"https://generativelanguage.googleapis.com/v1beta/models/{c.Model}:generateContent";
+                object thinkingCfg = c.UseBudgetZero
+                    ? new { thinkingBudget = 0 }
+                    : new { thinkingLevel = "MINIMAL" };
+
+                var payload = new
+                {
+                    contents = new[] { new { parts = new[] { new { text = prompt } } } },
+                    generationConfig = new
+                    {
+                        responseMimeType = "application/json",
+                        temperature = 0.25,
+                        maxOutputTokens = 240,
+                        thinkingConfig = thinkingCfg
+                    }
+                };
+
+                using var req = new HttpRequestMessage(HttpMethod.Post, url)
+                {
+                    Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
+                };
+                req.Headers.Add("x-goog-api-key", apiKey);
+
+                using var resp = await SharedHttp.SendAsync(req, cts.Token);
+                if (!resp.IsSuccessStatusCode)
+                    continue;
+
+                string body = await resp.Content.ReadAsStringAsync(cts.Token);
+                using var outerDoc = JsonDocument.Parse(body);
+                if (!outerDoc.RootElement.TryGetProperty("candidates", out JsonElement cands) || cands.GetArrayLength() == 0)
+                    continue;
+
+                string? innerJson = cands[0].GetProperty("content").GetProperty("parts")[0].GetProperty("text").GetString();
+                if (string.IsNullOrWhiteSpace(innerJson))
+                    continue;
+
+                using var innerDoc = JsonDocument.Parse(innerJson);
+                JsonElement root = innerDoc.RootElement;
+                string tema = ReadJsonString(root, "tema", "assunto").Trim().TrimEnd('.', ':', ';');
+                var bullets = new List<string>();
+
+                if (root.TryGetProperty("topicos", out JsonElement topicosEl) && topicosEl.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (JsonElement item in topicosEl.EnumerateArray())
+                    {
+                        if (item.ValueKind == JsonValueKind.String)
+                        {
+                            string b = (item.GetString() ?? string.Empty).Trim().TrimStart('•', '-', '*').Trim();
+                            if (!string.IsNullOrWhiteSpace(b))
+                                bullets.Add(EnsureSentenceCapitalizationAndPeriod(b));
+                        }
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(tema) && bullets.Count > 0)
+                {
+                    return (tema, bullets.Take(3).ToArray());
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        return null;
+    }
+
+    private static readonly HashSet<string> PortugueseStopWords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "o", "a", "os", "as", "um", "uma", "de", "do", "da", "dos", "das", "em", "no", "na", "nos", "nas",
+        "por", "para", "com", "sem", "que", "se", "como", "mais", "mas", "ou", "e", "é", "são", "foi", "está",
+        "estão", "ser", "ter", "vai", "vamos", "muito", "bem", "já", "aqui", "ali", "isso", "isto", "esse",
+        "essa", "este", "esta", "ele", "ela", "eles", "elas", "nós", "eu", "você", "então", "assim", "sobre",
+        "também", "quando", "onde", "porque", "pelo", "pela", "ao", "aos", "às", "dos", "bom", "boa", "tarde",
+        "dia", "noite", "olá", "gente", "cara", "caro", "todos", "todas"
+    };
+
+    public static string ExtractQuickLocalTheme(string text, string? fallbackPreviousTheme = null)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return !string.IsNullOrWhiteSpace(fallbackPreviousTheme) ? fallbackPreviousTheme : "Captando assunto ao vivo...";
+
+        var words = Regex.Matches(text, @"[A-Za-zÀ-ÿ0-9]{3,}")
+            .Select(m => m.Value)
+            .Where(w => !PortugueseStopWords.Contains(w))
+            .Take(5)
+            .ToArray();
+
+        if (words.Length == 0)
+            return !string.IsNullOrWhiteSpace(fallbackPreviousTheme) ? fallbackPreviousTheme : "Fala em andamento";
+
+        string rawTitle = string.Join(" ", words.Select((w, idx) =>
+            idx == 0 || w.Length > 3
+                ? char.ToUpper(w[0]) + w[1..]
+                : w.ToLowerInvariant()));
+
+        return rawTitle.Length > 48 ? rawTitle[..48].Trim() + "..." : rawTitle;
+    }
+
+    private static string[] BuildQuickLocalBullets(string cleanText)
+    {
+        string[] sentences = Regex.Split(cleanText, @"(?<=[.!?])\s+")
+            .Select(s => s.Trim())
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .Take(2)
+            .Select(EnsureSentenceCapitalizationAndPeriod)
+            .ToArray();
+
+        return sentences.Length > 0 ? sentences : new[] { EnsureSentenceCapitalizationAndPeriod(cleanText) };
     }
 
     public void Dispose()

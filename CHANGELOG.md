@@ -4,6 +4,12 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.13] — 26/10/2026
+
+Resumidor Tematico em Tempo Real (Linha do Tempo de Assuntos em Topicos): log continuo em realtime com horario, assunto atual e topicos para Ouvir PC e Microfone
+
+---
+
 ## [v1.3.12] — 26/10/2026
 
 Rodape da barra lateral em WrapPanel de 2 linhas (sem cortar botoes na lateral direita) + quebra automatica do subtitulo no topo

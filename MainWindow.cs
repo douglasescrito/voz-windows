@@ -410,6 +410,22 @@ public sealed class MainWindow : Window
             });
         };
 
+        _rewriter.OnTimelineEntryUpdated += (entry, isNew) =>
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                _rewriteDeck.AddOrUpdateTimelineEntry(entry, isNew);
+            });
+        };
+
+        _rewriter.OnCurrentLiveTopicPreview += (themeTitle, liveSnippet) =>
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                _rewriteDeck.UpdateLiveTopicPreview(themeTitle, liveSnippet);
+            });
+        };
+
         _rewriteDeck.OnUserDisabled += () =>
         {
             Dispatcher.BeginInvoke(MinimizeToTray);
@@ -503,6 +519,7 @@ public sealed class MainWindow : Window
                 if (!string.IsNullOrEmpty(sealedChunk))
                 {
                     _currentBlockCommittedText = CombineBlockText(_currentBlockCommittedText, sealedChunk);
+                    _rewriter.FlushPendingTimelineSegment(_cachedApiKey, _cursorSettings.SystemAudioLoopbackEnabled);
                     if (_cursorSettings.RealtimeRewriteEnabled)
                     {
                         _rewriter.RequestRealtimeRewrite(_cachedApiKey, _currentBlockCommittedText, isFinalCommit: true);
@@ -864,6 +881,7 @@ public sealed class MainWindow : Window
         ResetWaveformBars();
 
         await _gemini.StopAndFlushAsync();
+        _rewriter.FlushPendingTimelineSegment(_cachedApiKey, _cursorSettings.SystemAudioLoopbackEnabled);
 
         ResetIdleVisuals($"PRONTO • {_wordsTypedCount} palavras digitadas • Aperte F8 para falar");
     }
@@ -1124,6 +1142,7 @@ public sealed class MainWindow : Window
             if (!string.IsNullOrEmpty(sealedPrev))
             {
                 _currentBlockCommittedText = CombineBlockText(_currentBlockCommittedText, sealedPrev);
+                _rewriter.FlushPendingTimelineSegment(_cachedApiKey, _cursorSettings.SystemAudioLoopbackEnabled);
             }
         }
 
@@ -1136,6 +1155,12 @@ public sealed class MainWindow : Window
         {
             return;
         }
+
+        _rewriter.FeedLiveSpeechForTimeline(
+            _cachedApiKey,
+            normalized,
+            isFinalTurn: false,
+            isPcAudio: _cursorSettings.SystemAudioLoopbackEnabled);
 
         _livePreviewText.Text = "🗣️ " + RewriteDeckView.FormatRollingTailForCard(normalized, 130);
         _livePreviewText.Foreground = BrushSkyBlue;
@@ -1228,6 +1253,12 @@ public sealed class MainWindow : Window
         }
 
         _currentBlockCommittedText = CombineBlockText(_currentBlockCommittedText, cleaned);
+        _rewriter.FeedLiveSpeechForTimeline(
+            _cachedApiKey,
+            cleaned,
+            isFinalTurn: true,
+            isPcAudio: _cursorSettings.SystemAudioLoopbackEnabled);
+
         if (_rewriteTooltipEnabled)
         {
             if (rewriteEnabled)
