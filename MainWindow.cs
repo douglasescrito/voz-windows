@@ -52,6 +52,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock _livePreviewText;
     private readonly Button _rewriteToggleButton;
     private readonly Button _listenPcAudioButton;
+    private readonly Button _pcTypingModeButton;
     private readonly Button _headTrackerButton;
     private readonly Button _headRealtimeMouseButton;
     private readonly Button _headConfigButton;
@@ -294,9 +295,17 @@ public sealed class MainWindow : Window
 
         _listenPcAudioButton = CreateSmallActionButton(
             _cursorSettings.GetSystemAudioLoopbackPillText(),
-            "Ouvir o Computador (WASAPI Loopback): escuta o áudio reproduzido pelo Windows (vídeos, reuniões, áudios) e transcreve em tempo real");
+            "Ouvir o Computador (WASAPI Loopback): escuta o áudio reproduzido pelo Windows (vídeos, reuniões, áudios) e resume/transcreve em tempo real (Clique direito alterna entre Só Resumo e Digitar no Cursor)");
         _listenPcAudioButton.Foreground = _cursorSettings.SystemAudioLoopbackEnabled ? BrushGreenReady : BrushMutedGray;
         _listenPcAudioButton.Click += async (_, _) => await ToggleSystemAudioLoopbackAsync();
+        _listenPcAudioButton.MouseRightButtonUp += (_, _) => ToggleSystemAudioLoopbackTypeMode();
+
+        _pcTypingModeButton = CreateSmallActionButton(
+            _cursorSettings.GetSystemAudioLoopbackTypePillText(),
+            "Tipo do Ouvir PC: '📋 PC: Só Resumo' (escuta e monta a Linha do Tempo sem digitar no seu cursor) vs. '⌨️ PC: Digitar' (digita o áudio onde o cursor estiver)");
+        _pcTypingModeButton.Foreground = _cursorSettings.SystemAudioLoopbackTypeInCursor ? BrushAmberWarn : BrushSkyBlue;
+        _pcTypingModeButton.Click += (_, _) => ToggleSystemAudioLoopbackTypeMode();
+        _rewriteDeck.SetPcTypingModeVisual(_cursorSettings.SystemAudioLoopbackTypeInCursor);
 
         _headTrackerButton = CreateSmallActionButton(
             _cursorSettings.GetHeadTrackerPillText(),
@@ -351,6 +360,7 @@ public sealed class MainWindow : Window
 
         actionsPanel.Children.Add(_rewriteToggleButton);
         actionsPanel.Children.Add(_listenPcAudioButton);
+        actionsPanel.Children.Add(_pcTypingModeButton);
         actionsPanel.Children.Add(_headTrackerButton);
         actionsPanel.Children.Add(_headRealtimeMouseButton);
         actionsPanel.Children.Add(_headConfigButton);
@@ -437,6 +447,7 @@ public sealed class MainWindow : Window
         };
 
         _rewriteDeck.OnToggleRewriteModeRequested += ToggleRealtimeRewriteMode;
+        _rewriteDeck.OnTogglePcTypingModeRequested += ToggleSystemAudioLoopbackTypeMode;
 
         _rewriteDeck.OnRestorePreviousRequested += () =>
         {
@@ -839,13 +850,16 @@ public sealed class MainWindow : Window
 
         // Update UI to active listening state (True Dark border without blue frame)
         bool pcLoopback = _cursorSettings.SystemAudioLoopbackEnabled;
+        bool pcTypeCursor = _cursorSettings.SystemAudioLoopbackTypeInCursor;
         _mic.UseSystemLoopback = pcLoopback;
         _micButton.Background = new SolidColorBrush(Color.FromRgb(220, 38, 38)); // #DC2626
         _micButtonLabel.Text = (_isCompact || _rewriteTooltipEnabled) ? "⏹️ F8" : "⏹️ Parar (F8)";
         _outerBorder.BorderBrush = BrushDarkBorder;
         _statusDot.Fill = BrushRedLive;
         _statusText.Text = pcLoopback
-            ? "🎧 OUVINDO ÁUDIO DO COMPUTADOR (LOOPBACK AO VIVO) • Transcrevendo som do PC..."
+            ? (pcTypeCursor
+                ? "🎧 OUVINDO PC (DIGITANDO NO CURSOR + RESUMO) • Transcrevendo som do PC..."
+                : "🎧 OUVINDO PC (SÓ RESUMO • SEM DIGITAR NO CURSOR) • Montando Linha do Tempo...")
             : "OUVINDO AO VIVO • Qualidade máxima sem reescrita (gemini-3.5-transcribe-live)";
         _livePreviewText.Text = pcLoopback
             ? "🎧 Escutando o som do Windows... reproduza um áudio ou vídeo."
@@ -1165,10 +1179,15 @@ public sealed class MainWindow : Window
         _livePreviewText.Text = "🗣️ " + RewriteDeckView.FormatRollingTailForCard(normalized, 130);
         _livePreviewText.Foreground = BrushSkyBlue;
 
-        if (_liveCursorMode)
+        bool shouldTypeInCursor = !_cursorSettings.SystemAudioLoopbackEnabled || _cursorSettings.SystemAudioLoopbackTypeInCursor;
+        if (shouldTypeInCursor && _liveCursorMode)
         {
             string target = (_needsLeadingSpace ? " " : string.Empty) + normalized;
             _activeCursorInterim = SyncToCursor(_activeCursorInterim, target, isFinal: false);
+        }
+        else
+        {
+            _activeCursorInterim = normalized;
         }
 
         if (_rewriteTooltipEnabled)
@@ -1236,20 +1255,29 @@ public sealed class MainWindow : Window
         _livePreviewText.Text = "✓ " + RewriteDeckView.FormatRollingTailForCard(cleaned, 130);
         _livePreviewText.Foreground = BrushWhiteText;
 
-        if (_liveCursorMode)
+        bool shouldTypeInCursor = !_cursorSettings.SystemAudioLoopbackEnabled || _cursorSettings.SystemAudioLoopbackTypeInCursor;
+        if (shouldTypeInCursor)
         {
-            string onScreen = _activeCursorInterim;
-            string target = (_needsLeadingSpace ? " " : string.Empty) + cleaned;
-            string finalOnScreen = SyncToCursor(onScreen, target, isFinal: true);
-            _activeCursorInterim = string.Empty;
-            _lastAutoSealedText = string.Empty;
-            _needsLeadingSpace = !finalOnScreen.EndsWith(' ') && !finalOnScreen.EndsWith('\n');
+            if (_liveCursorMode)
+            {
+                string onScreen = _activeCursorInterim;
+                string target = (_needsLeadingSpace ? " " : string.Empty) + cleaned;
+                string finalOnScreen = SyncToCursor(onScreen, target, isFinal: true);
+                _activeCursorInterim = string.Empty;
+                _lastAutoSealedText = string.Empty;
+                _needsLeadingSpace = !finalOnScreen.EndsWith(' ') && !finalOnScreen.EndsWith('\n');
+            }
+            else
+            {
+                string toType = (_needsLeadingSpace ? " " : string.Empty) + cleaned;
+                NativeInterop.TypeUnicodeText(toType);
+                _needsLeadingSpace = !cleaned.EndsWith(' ') && !cleaned.EndsWith('\n');
+            }
         }
         else
         {
-            string toType = (_needsLeadingSpace ? " " : string.Empty) + cleaned;
-            NativeInterop.TypeUnicodeText(toType);
-            _needsLeadingSpace = !cleaned.EndsWith(' ') && !cleaned.EndsWith('\n');
+            _activeCursorInterim = string.Empty;
+            _lastAutoSealedText = string.Empty;
         }
 
         _currentBlockCommittedText = CombineBlockText(_currentBlockCommittedText, cleaned);
@@ -1550,15 +1578,54 @@ public sealed class MainWindow : Window
         RefreshTrayIconVisual();
     }
 
+    public void ToggleSystemAudioLoopbackTypeMode()
+    {
+        _cursorSettings.SystemAudioLoopbackTypeInCursor = !_cursorSettings.SystemAudioLoopbackTypeInCursor;
+        _cursorSettings.Save();
+
+        bool typeInCursor = _cursorSettings.SystemAudioLoopbackTypeInCursor;
+        _pcTypingModeButton.Content = _cursorSettings.GetSystemAudioLoopbackTypePillText();
+        _pcTypingModeButton.Foreground = typeInCursor ? BrushAmberWarn : BrushSkyBlue;
+        _rewriteDeck.SetPcTypingModeVisual(typeInCursor);
+
+        if (!typeInCursor)
+        {
+            // Se mudou para 'Só Resumo', desvincula o interim do cursor sem apagar o que já foi digitado
+            _activeCursorInterim = string.Empty;
+        }
+
+        if (_cursorSettings.SystemAudioLoopbackEnabled && _isListening)
+        {
+            _statusText.Text = typeInCursor
+                ? "🎧 OUVINDO PC (DIGITANDO NO CURSOR + RESUMO) • Digitação ativa no cursor!"
+                : "🎧 OUVINDO PC (SÓ RESUMO • SEM DIGITAR NO CURSOR) • Apenas Linha do Tempo!";
+        }
+        else
+        {
+            _statusText.Text = typeInCursor
+                ? "⌨️ MODO OUVIR PC: Configurado para DIGITAR NO CURSOR + Resumo"
+                : "📋 MODO OUVIR PC: Configurado para SÓ RESUMO (não digita no cursor)";
+        }
+    }
+
     public async Task ToggleSystemAudioLoopbackAsync()
     {
         _cursorSettings.SystemAudioLoopbackEnabled = !_cursorSettings.SystemAudioLoopbackEnabled;
         _cursorSettings.Save();
 
         bool pcLoopback = _cursorSettings.SystemAudioLoopbackEnabled;
+        bool pcTypeCursor = _cursorSettings.SystemAudioLoopbackTypeInCursor;
         _mic.UseSystemLoopback = pcLoopback;
         _listenPcAudioButton.Content = _cursorSettings.GetSystemAudioLoopbackPillText();
         _listenPcAudioButton.Foreground = pcLoopback ? BrushGreenReady : BrushMutedGray;
+        _pcTypingModeButton.Content = _cursorSettings.GetSystemAudioLoopbackTypePillText();
+        _pcTypingModeButton.Foreground = pcTypeCursor ? BrushAmberWarn : BrushSkyBlue;
+        _rewriteDeck.SetPcTypingModeVisual(pcTypeCursor);
+
+        if (pcLoopback && !pcTypeCursor && !IsVisible)
+        {
+            MaximizeToSidebar(ensureListening: false);
+        }
 
         if (_isListening)
         {
@@ -1568,7 +1635,9 @@ public sealed class MainWindow : Window
                 _mic.Start(chunkMs: 40);
                 _statusDot.Fill = BrushRedLive;
                 _statusText.Text = pcLoopback
-                    ? "🎧 OUVINDO ÁUDIO DO COMPUTADOR (LOOPBACK AO VIVO) • Transcrevendo som do PC..."
+                    ? (pcTypeCursor
+                        ? "🎧 OUVINDO PC (DIGITANDO NO CURSOR + RESUMO) • Transcrevendo som do PC..."
+                        : "🎧 OUVINDO PC (SÓ RESUMO • SEM DIGITAR NO CURSOR) • Montando Linha do Tempo...")
                     : "🎙️ MICROFONE FÍSICO ATIVO • Ouvindo sua voz...";
             }
             catch { }
@@ -1614,6 +1683,12 @@ public sealed class MainWindow : Window
         _listenPcAudioButton.Foreground = _cursorSettings.SystemAudioLoopbackEnabled
             ? BrushGreenReady
             : new SolidColorBrush(Color.FromRgb(148, 163, 184));
+
+        _pcTypingModeButton.Content = _cursorSettings.GetSystemAudioLoopbackTypePillText();
+        _pcTypingModeButton.Foreground = _cursorSettings.SystemAudioLoopbackTypeInCursor
+            ? BrushAmberWarn
+            : BrushSkyBlue;
+        _rewriteDeck.SetPcTypingModeVisual(_cursorSettings.SystemAudioLoopbackTypeInCursor);
 
         _headTrackerButton.Content = _cursorSettings.GetHeadTrackerPillText();
         _headTrackerButton.Foreground = enabled ? BrushGreenReady : new SolidColorBrush(Color.FromRgb(148, 163, 184));
@@ -1722,6 +1797,12 @@ public sealed class MainWindow : Window
         _listenPcAudioButton.Foreground = _cursorSettings.SystemAudioLoopbackEnabled
             ? BrushGreenReady
             : new SolidColorBrush(Color.FromRgb(148, 163, 184));
+
+        _pcTypingModeButton.Content = _cursorSettings.GetSystemAudioLoopbackTypePillText();
+        _pcTypingModeButton.Foreground = _cursorSettings.SystemAudioLoopbackTypeInCursor
+            ? BrushAmberWarn
+            : BrushSkyBlue;
+        _rewriteDeck.SetPcTypingModeVisual(_cursorSettings.SystemAudioLoopbackTypeInCursor);
 
         _headTrackerButton.Content = _cursorSettings.GetHeadTrackerPillText();
         _headTrackerButton.Foreground = _cursorSettings.HeadTrackerEnabled
@@ -1941,6 +2022,7 @@ public sealed class MainWindow : Window
         menu.Items.Add("📌 Maximizar na Barra Lateral / Minimizar para a Bandeja", null, (_, _) => Dispatcher.BeginInvoke(ToggleSidebarOrTray));
         menu.Items.Add("🎙️ Iniciar/Parar Ditado por Voz (F8)", null, (_, _) => Dispatcher.BeginInvoke(async () => await ToggleDictationAsync()));
         menu.Items.Add("🎧 Alternar Ouvir Áudio do Computador (Loopback ON / OFF)", null, (_, _) => Dispatcher.BeginInvoke(async () => await ToggleSystemAudioLoopbackAsync()));
+        menu.Items.Add("📋 Alternar Tipo do Ouvir PC: 'Só Resumo (Sem Digitar)' vs. 'Digitar no Cursor'", null, (_, _) => Dispatcher.BeginInvoke(ToggleSystemAudioLoopbackTypeMode));
         menu.Items.Add("⚡ Alternar Modo Nativo Direto vs. 6 Opções de Escrita", null, (_, _) => Dispatcher.BeginInvoke(ToggleRealtimeRewriteMode));
         if (CursorLoopSettings.IsCursorLoopSupported)
         {

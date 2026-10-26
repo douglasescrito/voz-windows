@@ -29,6 +29,7 @@ public sealed class CursorLoopSettings
     public double HeadRealtimeMouseSpeed { get; set; } = 1.2; // Velocidade espacial do cursor no modo Realtime + Touch (0.2x a 4.0x, padrão 1.2x)
     public int HeadTouchLockMs { get; set; } = 260; // Janela de prioridade do Touchpad ao combinar com o rosto (100ms a 600ms, padrão 260ms)
     public bool SystemAudioLoopbackEnabled { get; set; } = false; // Flag: Ouvir o áudio do próprio computador (WASAPI Loopback, começa desativado)
+    public bool SystemAudioLoopbackTypeInCursor { get; set; } = false; // Flag: No modo Ouvir PC, false = Só Resumo (não digita no cursor), true = Digita onde o cursor estiver
     public double HeadSensitivity { get; set; } = 2.4; // Multiplicador de sensibilidade do giro (0.5x a 4.5x)
     public double HeadDistanceBoost { get; set; } = 2.0; // Compensação automática para trabalhar mais distante (1.0x a 3.5x)
     public double HeadEnterThreshold { get; set; } = 0.080; // Limiar de disparo p/ 2º monitor (menor = mais sensível)
@@ -113,6 +114,11 @@ public sealed class CursorLoopSettings
     public string GetSystemAudioLoopbackPillText()
     {
         return SystemAudioLoopbackEnabled ? "🎧 Ouvir PC: ON" : "🎧 Ouvir PC: OFF";
+    }
+
+    public string GetSystemAudioLoopbackTypePillText()
+    {
+        return SystemAudioLoopbackTypeInCursor ? "⌨️ PC: Digitar" : "📋 PC: Só Resumo";
     }
 
     public string GetModePillText()

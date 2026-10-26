@@ -4,6 +4,12 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.14] — 26/10/2026
+
+Flag de dois modos para Ouvir PC: 'PC: So Resumo (Nao digita no cursor)' vs. 'PC: Digitar (Digita onde o cursor estiver)'
+
+---
+
 ## [v1.3.13] — 26/10/2026
 
 Resumidor Tematico em Tempo Real (Linha do Tempo de Assuntos em Topicos): log continuo em realtime com horario, assunto atual e topicos para Ouvir PC e Microfone

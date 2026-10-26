@@ -32,6 +32,7 @@ public sealed class RewriteDeckView : Border
     private readonly TextBlock _nativeLivePreviewBox;
     private readonly TextBlock _currentTopicBadgeText;
     private readonly TextBlock _timelineCountText;
+    private readonly Button _btnPcTypingMode;
     private readonly Button _btnCopyTimeline;
     private readonly ScrollViewer _timelineScrollViewer;
     private readonly StackPanel _timelineItemsStack;
@@ -114,6 +115,7 @@ public sealed class RewriteDeckView : Border
     public event Action? OnUserDisabled;
     public event Action? OnUpdateRequested;
     public event Action? OnToggleRewriteModeRequested;
+    public event Action? OnTogglePcTypingModeRequested;
 
     private static SolidColorBrush CreateFrozen(byte r, byte g, byte b)
     {
@@ -331,12 +333,24 @@ public sealed class RewriteDeckView : Border
         timelineToolbar.Children.Add(_timelineCountText);
 
         var timelineActionsRow = new StackPanel { Orientation = Orientation.Horizontal };
+        _btnPcTypingMode = CreateHeaderButton(
+            "📋 PC: Só Resumo",
+            "Alternar o modo Ouvir PC entre 'Só Resumo (Não digita no cursor)' e 'Digitar onde o cursor estiver'");
+        _btnPcTypingMode.Background = CreateFrozen(16, 36, 48);
+        _btnPcTypingMode.Foreground = BrushSkyAccent;
+        _btnPcTypingMode.Padding = new Thickness(7, 4, 7, 4);
+        _btnPcTypingMode.Margin = new Thickness(0, 0, 4, 0);
+        _btnPcTypingMode.Click += (_, _) =>
+        {
+            OnTogglePcTypingModeRequested?.Invoke();
+        };
+
         _btnCopyTimeline = CreateHeaderButton(
             "📋 Copiar Log",
             "Copiar toda a Linha do Tempo de Assuntos e Tópicos para a Área de Transferência");
         _btnCopyTimeline.Background = CreateFrozen(20, 42, 32);
         _btnCopyTimeline.Foreground = BrushAccentBrightGreen;
-        _btnCopyTimeline.Padding = new Thickness(8, 4, 8, 4);
+        _btnCopyTimeline.Padding = new Thickness(7, 4, 7, 4);
         _btnCopyTimeline.Margin = new Thickness(0, 0, 4, 0);
         _btnCopyTimeline.Click += (_, _) => CopyEntireTimelineToClipboard();
 
@@ -345,13 +359,14 @@ public sealed class RewriteDeckView : Border
             "Alternar para o gerador das 6 opções de escrita no mesmo espaço");
         btnEnableSixOptions.Background = CreateFrozen(28, 36, 52);
         btnEnableSixOptions.Foreground = BrushBrightText;
-        btnEnableSixOptions.Padding = new Thickness(8, 4, 8, 4);
+        btnEnableSixOptions.Padding = new Thickness(7, 4, 7, 4);
         btnEnableSixOptions.Margin = new Thickness(0);
         btnEnableSixOptions.Click += (_, _) =>
         {
             OnToggleRewriteModeRequested?.Invoke();
         };
 
+        timelineActionsRow.Children.Add(_btnPcTypingMode);
         timelineActionsRow.Children.Add(_btnCopyTimeline);
         timelineActionsRow.Children.Add(btnEnableSixOptions);
         Grid.SetColumn(timelineActionsRow, 1);
@@ -586,6 +601,13 @@ public sealed class RewriteDeckView : Border
         };
 
         Child = rootGrid;
+    }
+
+    public void SetPcTypingModeVisual(bool typeInCursor)
+    {
+        _btnPcTypingMode.Content = typeInCursor ? "⌨️ PC: Digitar" : "📋 PC: Só Resumo";
+        _btnPcTypingMode.Foreground = typeInCursor ? BrushAmberLoading : BrushSkyAccent;
+        _btnPcTypingMode.Background = typeInCursor ? CreateFrozen(44, 30, 14) : CreateFrozen(16, 36, 48);
     }
 
     public void SetRealtimeRewriteMode(bool enabled)
