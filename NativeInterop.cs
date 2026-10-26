@@ -933,6 +933,13 @@ public sealed class NativeMicrophoneCapture : IDisposable
     private readonly List<IntPtr> _headerPtrs = new();
     private readonly List<IntPtr> _dataPtrs = new();
     private volatile bool _isCapturing;
+    private System.Threading.Thread? _loopbackThread;
+
+    /// <summary>
+    /// Quando true, captura o áudio reproduzido pelo próprio computador (WASAPI Loopback — vídeos, reuniões, chamadas, áudios)
+    /// em vez do microfone físico. Começa sempre desativado (false).
+    /// </summary>
+    public bool UseSystemLoopback { get; set; } = false;
 
     public DateTime LastFrameUtc { get; private set; } = DateTime.UtcNow;
 
@@ -949,6 +956,20 @@ public sealed class NativeMicrophoneCapture : IDisposable
             return;
 
         LastFrameUtc = DateTime.UtcNow;
+
+        if (UseSystemLoopback)
+        {
+            _isCapturing = true;
+            _loopbackThread = new System.Threading.Thread(() => RunWasapiLoopbackCapture(chunkMs))
+            {
+                IsBackground = true,
+                Name = "VozWindowsWasapiLoopback"
+            };
+            _loopbackThread.SetApartmentState(System.Threading.ApartmentState.MTA);
+            _loopbackThread.Start();
+            return;
+        }
+
         int bufferBytes = 32 * chunkMs; // 16,000 Hz * 2 bytes/sample = 32 bytes/ms
         var format = new WAVEFORMATEX
         {
@@ -1032,10 +1053,18 @@ public sealed class NativeMicrophoneCapture : IDisposable
 
     public void Stop()
     {
-        if (!_isCapturing && _hWaveIn == IntPtr.Zero)
+        if (!_isCapturing && _hWaveIn == IntPtr.Zero && _loopbackThread == null)
             return;
 
         _isCapturing = false;
+
+        var lbThread = _loopbackThread;
+        _loopbackThread = null;
+        if (lbThread != null && lbThread.IsAlive)
+        {
+            try { lbThread.Join(350); } catch { }
+        }
+
         IntPtr handle = _hWaveIn;
         _hWaveIn = IntPtr.Zero;
 
@@ -1063,6 +1092,284 @@ public sealed class NativeMicrophoneCapture : IDisposable
             {
             }
         }
+    }
+
+    // --- WASAPI System Audio Loopback Capture (Ouvir o áudio do próprio computador em 16kHz PCM) ---
+    private const int eRender = 0;
+    private const int eConsole = 0;
+    private const int CLSCTX_ALL = 23;
+    private const int AUDCLNT_SHAREMODE_SHARED = 0;
+    private const int AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000;
+    private const int AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM = unchecked((int)0x80000000);
+    private const int AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY = 0x08000000;
+    private const uint AUDCLNT_BUFFERFLAGS_SILENT = 0x2;
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDeviceEnumerator
+    {
+        int EnumAudioEndpoints(int dataFlow, int dwStateMask, out IntPtr ppDevices);
+        int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IMMDevice
+    {
+        int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+    }
+
+    [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAudioClient
+    {
+        int Initialize(int ShareMode, int StreamFlags, long hnsBufferDuration, long hnsPeriodicity, IntPtr pFormat, IntPtr AudioSessionGuid);
+        int GetBufferSize(out uint pNumBufferFrames);
+        int GetStreamLatency(out long phnsLatency);
+        int GetCurrentPadding(out uint pNumPaddingFrames);
+        int IsFormatSupported(int ShareMode, IntPtr pFormat, out IntPtr ppClosestMatch);
+        int GetMixFormat(out IntPtr ppDeviceFormat);
+        int GetDevicePeriod(out long phnsDefaultDevicePeriod, out long phnsMinimumDevicePeriod);
+        int Start();
+        int Stop();
+        int Reset();
+        int SetEventHandle(IntPtr eventHandle);
+        int GetService(ref Guid riid, [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+    }
+
+    [ComImport, Guid("C8ADBD64-E71E-48a0-A4DE-185C395CD317"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IAudioCaptureClient
+    {
+        int GetBuffer(out IntPtr ppData, out uint pNumFramesToRead, out uint pdwFlags, out ulong pu64DevicePosition, out ulong pu64QPCPosition);
+        int ReleaseBuffer(uint NumFramesRead);
+        int GetNextPacketSize(out uint pNumFramesInNextPacket);
+    }
+
+    private void RunWasapiLoopbackCapture(int chunkMs)
+    {
+        IAudioClient? audioClient = null;
+        IAudioCaptureClient? captureClient = null;
+        IntPtr mixFormatPtr = IntPtr.Zero;
+        IntPtr targetFormatPtr = IntPtr.Zero;
+
+        try
+        {
+            var clsidEnumerator = new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E");
+            Type? enumType = Type.GetTypeFromCLSID(clsidEnumerator);
+            if (enumType == null)
+                return;
+
+            var enumerator = (IMMDeviceEnumerator?)Activator.CreateInstance(enumType);
+            if (enumerator == null)
+                return;
+
+            if (enumerator.GetDefaultAudioEndpoint(eRender, eConsole, out IMMDevice device) != 0 || device == null)
+                return;
+
+            var iidAudioClient = typeof(IAudioClient).GUID;
+            if (device.Activate(ref iidAudioClient, CLSCTX_ALL, IntPtr.Zero, out object clientObj) != 0)
+                return;
+
+            audioClient = (IAudioClient)clientObj;
+
+            var desiredFormat = new WAVEFORMATEX
+            {
+                wFormatTag = WAVE_FORMAT_PCM,
+                nChannels = 1,
+                nSamplesPerSec = 16000,
+                nAvgBytesPerSec = 32000,
+                nBlockAlign = 2,
+                wBitsPerSample = 16,
+                cbSize = 0
+            };
+
+            targetFormatPtr = Marshal.AllocHGlobal(Marshal.SizeOf<WAVEFORMATEX>());
+            Marshal.StructureToPtr(desiredFormat, targetFormatPtr, false);
+
+            bool isDirect16kMono = false;
+            int autoFlags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+            int hrInit = audioClient.Initialize(AUDCLNT_SHAREMODE_SHARED, autoFlags, 1_000_000, 0, targetFormatPtr, IntPtr.Zero);
+
+            int srcSampleRate = 16000;
+            int srcChannels = 1;
+            int srcBitsPerSample = 16;
+            bool srcIsFloat = false;
+
+            if (hrInit == 0)
+            {
+                isDirect16kMono = true;
+            }
+            else
+            {
+                if (audioClient.GetMixFormat(out mixFormatPtr) != 0 || mixFormatPtr == IntPtr.Zero)
+                    return;
+
+                var mixFmt = Marshal.PtrToStructure<WAVEFORMATEX>(mixFormatPtr);
+                srcChannels = Math.Max(1, (int)mixFmt.nChannels);
+                srcSampleRate = Math.Max(8000, (int)mixFmt.nSamplesPerSec);
+                srcBitsPerSample = mixFmt.wBitsPerSample;
+                ushort formatTag = mixFmt.wFormatTag;
+                if (formatTag == 0xFFFE && mixFmt.cbSize >= 22)
+                {
+                    formatTag = (ushort)Marshal.ReadInt16(mixFormatPtr, 24);
+                }
+                srcIsFloat = (formatTag == 3) || (srcBitsPerSample == 32);
+
+                if (audioClient.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 1_000_000, 0, mixFormatPtr, IntPtr.Zero) != 0)
+                    return;
+            }
+
+            var iidCaptureClient = typeof(IAudioCaptureClient).GUID;
+            if (audioClient.GetService(ref iidCaptureClient, out object capObj) != 0)
+                return;
+
+            captureClient = (IAudioCaptureClient)capObj;
+            if (audioClient.Start() != 0)
+                return;
+
+            int targetChunkBytes = 32 * chunkMs; // 16kHz * 2 bytes = 32 bytes/ms (1280 bytes por 40ms)
+            byte[] outAccumulator = new byte[targetChunkBytes];
+            int outOffset = 0;
+            double resamplePos = 0.0;
+            double stepRatio = (double)srcSampleRate / 16000.0;
+            long lastEmitTick = Environment.TickCount64;
+
+            while (_isCapturing)
+            {
+                LastFrameUtc = DateTime.UtcNow;
+                int hrPkt = captureClient.GetNextPacketSize(out uint packetFrames);
+                if (hrPkt != 0)
+                    break;
+
+                if (packetFrames == 0)
+                {
+                    long nowTick = Environment.TickCount64;
+                    if (nowTick - lastEmitTick >= chunkMs)
+                    {
+                        lastEmitTick = nowTick;
+                        byte[] silentChunk = new byte[targetChunkBytes];
+                        OnPcmFrame?.Invoke(silentChunk, 0.0);
+                    }
+                    System.Threading.Thread.Sleep(8);
+                    continue;
+                }
+
+                while (packetFrames > 0 && _isCapturing)
+                {
+                    if (captureClient.GetBuffer(out IntPtr dataPtr, out uint numFrames, out uint flags, out _, out _) != 0)
+                        break;
+
+                    try
+                    {
+                        bool isSilent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || dataPtr == IntPtr.Zero;
+                        if (isDirect16kMono)
+                        {
+                            int bytesAvailable = (int)(numFrames * 2);
+                            int srcIdx = 0;
+                            while (srcIdx < bytesAvailable)
+                            {
+                                int toCopy = Math.Min(targetChunkBytes - outOffset, bytesAvailable - srcIdx);
+                                if (isSilent)
+                                {
+                                    Array.Clear(outAccumulator, outOffset, toCopy);
+                                }
+                                else
+                                {
+                                    Marshal.Copy(IntPtr.Add(dataPtr, srcIdx), outAccumulator, outOffset, toCopy);
+                                }
+                                outOffset += toCopy;
+                                srcIdx += toCopy;
+
+                                if (outOffset >= targetChunkBytes)
+                                {
+                                    EmitPcm16kChunk(outAccumulator, targetChunkBytes);
+                                    outOffset = 0;
+                                    lastEmitTick = Environment.TickCount64;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            int bytesPerSample = Math.Max(2, srcBitsPerSample / 8);
+                            int frameStride = srcChannels * bytesPerSample;
+
+                            while (resamplePos < numFrames)
+                            {
+                                int frameIdx = (int)resamplePos;
+                                short monoSample = 0;
+                                if (!isSilent)
+                                {
+                                    double sum = 0;
+                                    int baseByte = frameIdx * frameStride;
+                                    for (int ch = 0; ch < srcChannels; ch++)
+                                    {
+                                        int sampleByteOffset = baseByte + (ch * bytesPerSample);
+                                        if (srcIsFloat && bytesPerSample == 4)
+                                        {
+                                            int bits = Marshal.ReadInt32(dataPtr, sampleByteOffset);
+                                            float f = BitConverter.Int32BitsToSingle(bits);
+                                            sum += Math.Clamp(f, -1.0f, 1.0f);
+                                        }
+                                        else if (bytesPerSample >= 2)
+                                        {
+                                            short s = Marshal.ReadInt16(dataPtr, sampleByteOffset);
+                                            sum += s / 32768.0;
+                                        }
+                                    }
+                                    double avg = sum / srcChannels;
+                                    monoSample = (short)Math.Clamp(avg * 32767.0, short.MinValue, short.MaxValue);
+                                }
+
+                                outAccumulator[outOffset] = (byte)(monoSample & 0xFF);
+                                outAccumulator[outOffset + 1] = (byte)((monoSample >> 8) & 0xFF);
+                                outOffset += 2;
+
+                                if (outOffset >= targetChunkBytes)
+                                {
+                                    EmitPcm16kChunk(outAccumulator, targetChunkBytes);
+                                    outOffset = 0;
+                                    lastEmitTick = Environment.TickCount64;
+                                }
+
+                                resamplePos += stepRatio;
+                            }
+                            resamplePos -= numFrames;
+                            if (resamplePos < 0) resamplePos = 0;
+                        }
+                    }
+                    finally
+                    {
+                        captureClient.ReleaseBuffer(numFrames);
+                    }
+
+                    if (captureClient.GetNextPacketSize(out packetFrames) != 0)
+                        break;
+                }
+            }
+        }
+        catch
+        {
+        }
+        finally
+        {
+            try { audioClient?.Stop(); } catch { }
+            if (mixFormatPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(mixFormatPtr);
+            if (targetFormatPtr != IntPtr.Zero) Marshal.FreeHGlobal(targetFormatPtr);
+        }
+    }
+
+    private void EmitPcm16kChunk(byte[] buffer, int length)
+    {
+        byte[] pcm = new byte[length];
+        Buffer.BlockCopy(buffer, 0, pcm, 0, length);
+
+        double sumSquares = 0;
+        int sampleCount = length / 2;
+        for (int i = 0; i < length - 1; i += 2)
+        {
+            short sample = (short)(pcm[i] | (pcm[i + 1] << 8));
+            double norm = sample / 32768.0;
+            sumSquares += norm * norm;
+        }
+        double rms = sampleCount > 0 ? Math.Sqrt(sumSquares / sampleCount) : 0;
+        OnPcmFrame?.Invoke(pcm, rms);
     }
 
     public void Dispose() => Stop();

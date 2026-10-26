@@ -26,7 +26,9 @@ public sealed class CursorLoopSettings
     public bool RealtimeRewriteEnabled { get; set; } = false; // false = Modo Nativo Puro (sem correção/sem 6 opções)
     public bool HeadTrackerEnabled { get; set; } = false; // Flag: Move mouse to center of 2nd monitor when face turns right
     public bool HeadRealtimeMouseEnabled { get; set; } = false; // Flag: Controla o mouse continuamente em tempo real com o rosto (começa desativado)
-    public double HeadRealtimeMouseSpeed { get; set; } = 4.2; // Velocidade do cursor no modo Realtime (1.0x a 10.0x)
+    public double HeadRealtimeMouseSpeed { get; set; } = 1.2; // Velocidade espacial do cursor no modo Realtime + Touch (0.2x a 4.0x, padrão 1.2x)
+    public int HeadTouchLockMs { get; set; } = 260; // Janela de prioridade do Touchpad ao combinar com o rosto (100ms a 600ms, padrão 260ms)
+    public bool SystemAudioLoopbackEnabled { get; set; } = false; // Flag: Ouvir o áudio do próprio computador (WASAPI Loopback, começa desativado)
     public double HeadSensitivity { get; set; } = 2.4; // Multiplicador de sensibilidade do giro (0.5x a 4.5x)
     public double HeadDistanceBoost { get; set; } = 2.0; // Compensação automática para trabalhar mais distante (1.0x a 3.5x)
     public double HeadEnterThreshold { get; set; } = 0.080; // Limiar de disparo p/ 2º monitor (menor = mais sensível)
@@ -106,6 +108,11 @@ public sealed class CursorLoopSettings
     public string GetHeadRealtimeMousePillText()
     {
         return HeadRealtimeMouseEnabled ? "🖱️ Mouse RT: ON" : "🖱️ Mouse RT: OFF";
+    }
+
+    public string GetSystemAudioLoopbackPillText()
+    {
+        return SystemAudioLoopbackEnabled ? "🎧 Ouvir PC: ON" : "🎧 Ouvir PC: OFF";
     }
 
     public string GetModePillText()
@@ -210,14 +217,19 @@ public sealed class CursorLoopSettings
         if (loaded is not null)
         {
             // Sempre iniciar com o teletransporte de borda (Loop ON) ativo ao abrir o aplicativo na maquina do dono
-            // E o modo Função Realtime de controle do mouse sempre começa DESATIVADO ao abrir o app
+            // E o modo Função Realtime de controle do mouse e Ouvir PC sempre começam DESATIVADOS ao abrir o app
             loaded.Enabled = true;
             loaded.HorizontalLoop = true;
             loaded.VerticalLoop = true;
             loaded.HeadRealtimeMouseEnabled = false;
+            loaded.SystemAudioLoopbackEnabled = false;
             if (loaded.HeadRealtimeMouseSpeed <= 0.1)
             {
                 loaded.HeadRealtimeMouseSpeed = 1.2;
+            }
+            if (loaded.HeadTouchLockMs < 80 || loaded.HeadTouchLockMs > 800)
+            {
+                loaded.HeadTouchLockMs = 260;
             }
             if (loaded.HeadConfigVersion < 2)
             {
@@ -234,6 +246,7 @@ public sealed class CursorLoopSettings
             if (loaded.HeadConfigVersion < 3)
             {
                 loaded.HeadRealtimeMouseSpeed = 1.2;
+                loaded.HeadTouchLockMs = 260;
                 loaded.HeadConfigVersion = 3;
             }
             loaded.Save();
@@ -247,6 +260,8 @@ public sealed class CursorLoopSettings
             HeadTrackerEnabled = false,
             HeadRealtimeMouseEnabled = false,
             HeadRealtimeMouseSpeed = 1.2,
+            HeadTouchLockMs = 260,
+            SystemAudioLoopbackEnabled = false,
             HeadSensitivity = 2.4,
             HeadDistanceBoost = 2.0,
             HeadEnterThreshold = 0.080,
@@ -1200,9 +1215,10 @@ public sealed class HeadMonitorTracker : IDisposable
         }
 
         long elapsedSinceTouch = now - _lastTouchpadRecalibTick;
+        int touchLockMs = Math.Clamp(Settings?.HeadTouchLockMs ?? 260, 80, 800);
 
-        // Prioridade total ao Touchpad por 260ms após cada toque: garante controle fino e cliques sem nenhuma briga com a câmera!
-        if (elapsedSinceTouch < 260)
+        // Prioridade total ao Touchpad após cada toque: garante controle fino e cliques sem nenhuma briga com a câmera!
+        if (elapsedSinceTouch < touchLockMs)
         {
             try
             {
@@ -1233,7 +1249,7 @@ public sealed class HeadMonitorTracker : IDisposable
         }
 
         // Rampa suave (350ms) após o término do uso do Touchpad para transição imperceptível entre Touch e Rosto
-        double postTouchRamp = Math.Clamp((elapsedSinceTouch - 260.0) / 350.0, 0.0, 1.0);
+        double postTouchRamp = Math.Clamp((elapsedSinceTouch - touchLockMs) / 350.0, 0.0, 1.0);
         double speedSetting = Math.Clamp(Settings?.HeadRealtimeMouseSpeed ?? 1.2, 0.15, 6.0);
 
         // Escala espacial controlada e proporcional (desacoplada do ganho do 2º monitor):
@@ -1957,6 +1973,8 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
     private readonly System.Windows.Controls.TextBlock _smoothingValueText;
     private readonly System.Windows.Controls.Slider _realtimeSpeedSlider;
     private readonly System.Windows.Controls.TextBlock _realtimeSpeedValueText;
+    private readonly System.Windows.Controls.Slider _touchLockSlider;
+    private readonly System.Windows.Controls.TextBlock _touchLockValueText;
 
     private readonly System.Windows.Controls.CheckBox _enableTrackerCheck;
     private readonly System.Windows.Controls.CheckBox _enableRealtimeMouseCheck;
@@ -2197,7 +2215,77 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
 
         mainStack.Children.Add(topGrid);
 
-        // 3. Painel de Sliders de Sensibilidade e Distância
+        // 2B. Card Dedicado em Destaque: Controle Espacial Realtime (Mouse RT + Fusão com Touchpad)
+        var rtCard = new System.Windows.Controls.Border
+        {
+            Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(16, 24, 38)),
+            BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(56, 189, 248)),
+            BorderThickness = new System.Windows.Thickness(1.5),
+            CornerRadius = new System.Windows.CornerRadius(10),
+            Padding = new System.Windows.Thickness(16, 12, 16, 12),
+            Margin = new System.Windows.Thickness(0, 0, 0, 12)
+        };
+
+        var rtStack = new System.Windows.Controls.StackPanel();
+
+        var rtTitleRow = new System.Windows.Controls.DockPanel { Margin = new System.Windows.Thickness(0, 0, 0, 6) };
+        var rtHeaderText = new System.Windows.Controls.TextBlock
+        {
+            Text = "🖱️ Controle Espacial Realtime (Mouse RT + Fusão com Touchpad)",
+            FontSize = 14,
+            FontWeight = System.Windows.FontWeights.Bold,
+            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(56, 189, 248)),
+            VerticalAlignment = System.Windows.VerticalAlignment.Center
+        };
+        rtTitleRow.Children.Add(rtHeaderText);
+        rtStack.Children.Add(rtTitleRow);
+
+        _enableRealtimeMouseCheck = CreateCheckBox(
+            "🖱️ Ativar Modo Função Realtime (Guiar o mouse com o rosto + reposicionar e calibrar com o Touchpad • Começa Desativado)",
+            _settings.HeadRealtimeMouseEnabled);
+        _enableRealtimeMouseCheck.FontWeight = System.Windows.FontWeights.SemiBold;
+        _enableRealtimeMouseCheck.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(244, 244, 245));
+        _enableRealtimeMouseCheck.Margin = new System.Windows.Thickness(0, 0, 0, 8);
+        _enableRealtimeMouseCheck.Checked += async (_, _) => await HandleRealtimeMouseCheckChangedAsync(true);
+        _enableRealtimeMouseCheck.Unchecked += async (_, _) => await HandleRealtimeMouseCheckChangedAsync(false);
+        rtStack.Children.Add(_enableRealtimeMouseCheck);
+
+        (_realtimeSpeedSlider, _realtimeSpeedValueText) = AddSliderRow(
+            rtStack,
+            "🎚️ Velocidade / Sensibilidade Espacial do Mouse RT (Padrão Ideal: 1.2x • Menor = mais suave | Maior = alcance mais rápido):",
+            0.2, 4.0, _settings.HeadRealtimeMouseSpeed, "0.0x",
+            val =>
+            {
+                _settings.HeadRealtimeMouseSpeed = Math.Round(val, 1);
+                _settings.Save();
+            });
+
+        var rtPresetRow = new System.Windows.Controls.WrapPanel { Margin = new System.Windows.Thickness(0, 0, 0, 8) };
+        var btnSpeedSoft = CreateActionButton("🐢 0.8x Mais Suave", false);
+        btnSpeedSoft.Click += (_, _) => SetRealtimeSpeedSliderValue(0.8);
+        var btnSpeedIdeal = CreateActionButton("✨ 1.2x Velocidade Ideal (Padrão)", true);
+        btnSpeedIdeal.Click += (_, _) => SetRealtimeSpeedSliderValue(1.2);
+        var btnSpeedFast = CreateActionButton("🚀 1.8x Mais Rápido", false);
+        btnSpeedFast.Click += (_, _) => SetRealtimeSpeedSliderValue(1.8);
+        rtPresetRow.Children.Add(btnSpeedSoft);
+        rtPresetRow.Children.Add(btnSpeedIdeal);
+        rtPresetRow.Children.Add(btnSpeedFast);
+        rtStack.Children.Add(rtPresetRow);
+
+        (_touchLockSlider, _touchLockValueText) = AddSliderRow(
+            rtStack,
+            "🤝 Prioridade do Touchpad ao Combinar (Trava após tocar no Touch p/ clicar sem interferência da câmera):",
+            100, 600, _settings.HeadTouchLockMs, "0ms",
+            val =>
+            {
+                _settings.HeadTouchLockMs = (int)Math.Round(val);
+                _settings.Save();
+            });
+
+        rtCard.Child = rtStack;
+        mainStack.Children.Add(rtCard);
+
+        // 3. Painel de Sliders de Sensibilidade e Distância (Salto p/ 2º Monitor)
         var slidersCard = new System.Windows.Controls.Border
         {
             Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(18, 18, 22)),
@@ -2212,7 +2300,7 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
 
         (_sensitivitySlider, _sensitivityValueText) = AddSliderRow(
             slidersStack,
-            "1. Sensibilidade do Giro de Cabeça (Mais alto = exige menos rotação para a direita):",
+            "1. Sensibilidade do Giro de Cabeça p/ 2º Monitor (Mais alto = exige menos rotação para a direita):",
             0.5, 4.5, _settings.HeadSensitivity, "0.0x",
             val =>
             {
@@ -2252,30 +2340,12 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
                 _settings.Save();
             });
 
-        (_realtimeSpeedSlider, _realtimeSpeedValueText) = AddSliderRow(
-            slidersStack,
-            "5. Sensibilidade Espacial do Mouse RT (Mais baixo = mais suave e fácil de combinar com o Touch):",
-            0.2, 4.0, _settings.HeadRealtimeMouseSpeed, "0.0x",
-            val =>
-            {
-                _settings.HeadRealtimeMouseSpeed = Math.Round(val, 1);
-                _settings.Save();
-            });
-
         // Checkboxes de configuração
         _enableTrackerCheck = CreateCheckBox(
             "☑ Ativar modo Head Motion Monitor (Mover mouse p/ centro do 2º monitor ao virar o rosto à direita)",
             _settings.HeadTrackerEnabled);
         _enableTrackerCheck.Checked += async (_, _) => await HandleEnableCheckChangedAsync(true);
         _enableTrackerCheck.Unchecked += async (_, _) => await HandleEnableCheckChangedAsync(false);
-
-        _enableRealtimeMouseCheck = CreateCheckBox(
-            "🖱️ Ativar Modo Função Realtime para Controlar o Mouse com o Rosto (X e Y contínuo • Começa Desativado)",
-            _settings.HeadRealtimeMouseEnabled);
-        _enableRealtimeMouseCheck.FontWeight = System.Windows.FontWeights.SemiBold;
-        _enableRealtimeMouseCheck.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(56, 189, 248));
-        _enableRealtimeMouseCheck.Checked += async (_, _) => await HandleRealtimeMouseCheckChangedAsync(true);
-        _enableRealtimeMouseCheck.Unchecked += async (_, _) => await HandleRealtimeMouseCheckChangedAsync(false);
 
         _returnPrimaryCheck = CreateCheckBox(
             "☑ Retornar automaticamente o mouse p/ o centro do 1º monitor quando voltar a olhar reto",
@@ -2296,7 +2366,6 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
         _pauseWarpCheck.Unchecked += (_, _) => _tracker.PauseMouseWarpForTest = false;
 
         slidersStack.Children.Add(_enableTrackerCheck);
-        slidersStack.Children.Add(_enableRealtimeMouseCheck);
         slidersStack.Children.Add(_returnPrimaryCheck);
         slidersStack.Children.Add(_hdLongDistanceCheck);
         slidersStack.Children.Add(_pauseWarpCheck);
@@ -2340,6 +2409,27 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
         {
             _enableTrackerCheck.IsChecked = _settings.HeadTrackerEnabled;
             _enableRealtimeMouseCheck.IsChecked = _settings.HeadRealtimeMouseEnabled;
+            _realtimeSpeedSlider.Value = _settings.HeadRealtimeMouseSpeed;
+            _realtimeSpeedValueText.Text = _settings.HeadRealtimeMouseSpeed.ToString("0.0x", CultureInfo.InvariantCulture);
+            _touchLockSlider.Value = _settings.HeadTouchLockMs;
+            _touchLockValueText.Text = _settings.HeadTouchLockMs.ToString("0ms", CultureInfo.InvariantCulture);
+        }
+        finally
+        {
+            _suppressEvents = false;
+        }
+    }
+
+    private void SetRealtimeSpeedSliderValue(double speed)
+    {
+        _suppressEvents = true;
+        try
+        {
+            double rounded = Math.Round(Math.Clamp(speed, 0.2, 4.0), 1);
+            _settings.HeadRealtimeMouseSpeed = rounded;
+            _settings.Save();
+            _realtimeSpeedSlider.Value = rounded;
+            _realtimeSpeedValueText.Text = rounded.ToString("0.0x", CultureInfo.InvariantCulture);
         }
         finally
         {

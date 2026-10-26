@@ -51,6 +51,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock _statusText;
     private readonly TextBlock _livePreviewText;
     private readonly Button _rewriteToggleButton;
+    private readonly Button _listenPcAudioButton;
     private readonly Button _headTrackerButton;
     private readonly Button _headRealtimeMouseButton;
     private readonly Button _headConfigButton;
@@ -286,6 +287,12 @@ public sealed class MainWindow : Window
         _rewriteToggleButton.Click += (_, _) => ToggleRealtimeRewriteMode();
         _rewriteDeck.SetRealtimeRewriteMode(_cursorSettings.RealtimeRewriteEnabled);
 
+        _listenPcAudioButton = CreateSmallActionButton(
+            _cursorSettings.GetSystemAudioLoopbackPillText(),
+            "Ouvir o Computador (WASAPI Loopback): escuta o áudio reproduzido pelo Windows (vídeos, reuniões, áudios) e transcreve em tempo real");
+        _listenPcAudioButton.Foreground = _cursorSettings.SystemAudioLoopbackEnabled ? BrushGreenReady : BrushMutedGray;
+        _listenPcAudioButton.Click += async (_, _) => await ToggleSystemAudioLoopbackAsync();
+
         _headTrackerButton = CreateSmallActionButton(
             _cursorSettings.GetHeadTrackerPillText(),
             "Alternar Head Motion Detection: move o mouse para o centro do 2º monitor quando o rosto vira para a direita em tempo real (Clique direito abre a tela de Teste e Sensibilidade)");
@@ -334,6 +341,7 @@ public sealed class MainWindow : Window
         closeButton.Click += (_, _) => MinimizeToTray();
 
         actionsPanel.Children.Add(_rewriteToggleButton);
+        actionsPanel.Children.Add(_listenPcAudioButton);
         actionsPanel.Children.Add(_headTrackerButton);
         actionsPanel.Children.Add(_headRealtimeMouseButton);
         actionsPanel.Children.Add(_headConfigButton);
@@ -548,6 +556,8 @@ public sealed class MainWindow : Window
         {
             _cursorSettings.Enabled = true;
             _cursorSettings.HeadRealtimeMouseEnabled = false; // Always starts disabled on startup
+            _cursorSettings.SystemAudioLoopbackEnabled = false; // Always starts disabled on startup
+            _mic.UseSystemLoopback = false;
             _cursorSettings.Save();
             ApplyCursorLoopToBar();
             if (_cursorSettings.HeadTrackerEnabled || _cursorSettings.HeadRealtimeMouseEnabled)
@@ -801,12 +811,18 @@ public sealed class MainWindow : Window
             Show();
 
         // Update UI to active listening state (True Dark border without blue frame)
+        bool pcLoopback = _cursorSettings.SystemAudioLoopbackEnabled;
+        _mic.UseSystemLoopback = pcLoopback;
         _micButton.Background = new SolidColorBrush(Color.FromRgb(220, 38, 38)); // #DC2626
         _micButtonLabel.Text = (_isCompact || _rewriteTooltipEnabled) ? "⏹️ F8" : "⏹️ Parar (F8)";
         _outerBorder.BorderBrush = BrushDarkBorder;
         _statusDot.Fill = BrushRedLive;
-        _statusText.Text = "OUVINDO AO VIVO • Qualidade máxima sem reescrita (gemini-3.5-transcribe-live)";
-        _livePreviewText.Text = "Estou ouvindo... fale agora.";
+        _statusText.Text = pcLoopback
+            ? "🎧 OUVINDO ÁUDIO DO COMPUTADOR (LOOPBACK AO VIVO) • Transcrevendo som do PC..."
+            : "OUVINDO AO VIVO • Qualidade máxima sem reescrita (gemini-3.5-transcribe-live)";
+        _livePreviewText.Text = pcLoopback
+            ? "🎧 Escutando o som do Windows... reproduza um áudio ou vídeo."
+            : "Estou ouvindo... fale agora.";
         _livePreviewText.Foreground = BrushWhiteText;
         RefreshTrayIconVisual();
 
@@ -1493,6 +1509,41 @@ public sealed class MainWindow : Window
         RefreshTrayIconVisual();
     }
 
+    public async Task ToggleSystemAudioLoopbackAsync()
+    {
+        _cursorSettings.SystemAudioLoopbackEnabled = !_cursorSettings.SystemAudioLoopbackEnabled;
+        _cursorSettings.Save();
+
+        bool pcLoopback = _cursorSettings.SystemAudioLoopbackEnabled;
+        _mic.UseSystemLoopback = pcLoopback;
+        _listenPcAudioButton.Content = _cursorSettings.GetSystemAudioLoopbackPillText();
+        _listenPcAudioButton.Foreground = pcLoopback ? BrushGreenReady : BrushMutedGray;
+
+        if (_isListening)
+        {
+            try
+            {
+                _mic.Stop();
+                _mic.Start(chunkMs: 40);
+                _statusDot.Fill = BrushRedLive;
+                _statusText.Text = pcLoopback
+                    ? "🎧 OUVINDO ÁUDIO DO COMPUTADOR (LOOPBACK AO VIVO) • Transcrevendo som do PC..."
+                    : "🎙️ MICROFONE FÍSICO ATIVO • Ouvindo sua voz...";
+            }
+            catch { }
+        }
+        else if (pcLoopback)
+        {
+            await StartDictationAsync();
+        }
+        else
+        {
+            _statusDot.Fill = BrushSkyBlue;
+            _statusText.Text = "🎧 OUVIR PC DESATIVADO • Fonte voltou para o Microfone padrão (F8)";
+        }
+        UpdateTrayTooltip();
+    }
+
     public void OpenHeadTrackerConfigWindow()
     {
         if (_headConfigWindow != null && _headConfigWindow.IsLoaded)
@@ -1517,6 +1568,11 @@ public sealed class MainWindow : Window
     {
         _cursorSettings.ToggleHeadTrackerOnBar();
         bool enabled = _cursorSettings.HeadTrackerEnabled;
+
+        _listenPcAudioButton.Content = _cursorSettings.GetSystemAudioLoopbackPillText();
+        _listenPcAudioButton.Foreground = _cursorSettings.SystemAudioLoopbackEnabled
+            ? BrushGreenReady
+            : new SolidColorBrush(Color.FromRgb(148, 163, 184));
 
         _headTrackerButton.Content = _cursorSettings.GetHeadTrackerPillText();
         _headTrackerButton.Foreground = enabled ? BrushGreenReady : new SolidColorBrush(Color.FromRgb(148, 163, 184));
@@ -1620,6 +1676,11 @@ public sealed class MainWindow : Window
         bool speedActive = mult > 1.001;
         _cursorEngine.SpeedMultiplier = mult;
         _cursorEngine.SmartPrecision = _cursorSettings.SmartPrecision;
+
+        _listenPcAudioButton.Content = _cursorSettings.GetSystemAudioLoopbackPillText();
+        _listenPcAudioButton.Foreground = _cursorSettings.SystemAudioLoopbackEnabled
+            ? BrushGreenReady
+            : new SolidColorBrush(Color.FromRgb(148, 163, 184));
 
         _headTrackerButton.Content = _cursorSettings.GetHeadTrackerPillText();
         _headTrackerButton.Foreground = _cursorSettings.HeadTrackerEnabled
@@ -1838,6 +1899,7 @@ public sealed class MainWindow : Window
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("📌 Maximizar na Barra Lateral / Minimizar para a Bandeja", null, (_, _) => Dispatcher.BeginInvoke(ToggleSidebarOrTray));
         menu.Items.Add("🎙️ Iniciar/Parar Ditado por Voz (F8)", null, (_, _) => Dispatcher.BeginInvoke(async () => await ToggleDictationAsync()));
+        menu.Items.Add("🎧 Alternar Ouvir Áudio do Computador (Loopback ON / OFF)", null, (_, _) => Dispatcher.BeginInvoke(async () => await ToggleSystemAudioLoopbackAsync()));
         menu.Items.Add("⚡ Alternar Modo Nativo Direto vs. 6 Opções de Escrita", null, (_, _) => Dispatcher.BeginInvoke(ToggleRealtimeRewriteMode));
         if (CursorLoopSettings.IsCursorLoopSupported)
         {

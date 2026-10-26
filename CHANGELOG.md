@@ -4,6 +4,12 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.11] — 26/10/2026
+
+Card dedicado com Sliders de Velocidade/Sensibilidade Espacial do Mouse RT (1.2x padrao + presets 0.8x/1.2x/1.8x + Trava do Touch) e modo Ouvir o Computador (WASAPI Loopback ON/OFF)
+
+---
+
 ## [v1.3.10] — 26/10/2026
 
 - Reducao e calibragem fina da sensibilidade espacial do Mouse RT (desacoplado do ganho alto do 2o monitor e sem jitter de caixa do FaceDetector)
