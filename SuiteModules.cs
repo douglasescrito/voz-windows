@@ -25,6 +25,8 @@ public sealed class CursorLoopSettings
     public int SpeedLevel { get; set; } = 0; // 0 = 1.0x (OFF), 1 = 1.8x, 2 = 2.8x, 3 = 4.5x
     public bool RealtimeRewriteEnabled { get; set; } = false; // false = Modo Nativo Puro (sem correção/sem 6 opções)
     public bool HeadTrackerEnabled { get; set; } = false; // Flag: Move mouse to center of 2nd monitor when face turns right
+    public bool HeadRealtimeMouseEnabled { get; set; } = false; // Flag: Controla o mouse continuamente em tempo real com o rosto (começa desativado)
+    public double HeadRealtimeMouseSpeed { get; set; } = 4.2; // Velocidade do cursor no modo Realtime (1.0x a 10.0x)
     public double HeadSensitivity { get; set; } = 2.4; // Multiplicador de sensibilidade do giro (0.5x a 4.5x)
     public double HeadDistanceBoost { get; set; } = 2.0; // Compensação automática para trabalhar mais distante (1.0x a 3.5x)
     public double HeadEnterThreshold { get; set; } = 0.080; // Limiar de disparo p/ 2º monitor (menor = mais sensível)
@@ -101,6 +103,11 @@ public sealed class CursorLoopSettings
         return HeadTrackerEnabled ? "👀 Head ON" : "👀 Head OFF";
     }
 
+    public string GetHeadRealtimeMousePillText()
+    {
+        return HeadRealtimeMouseEnabled ? "🖱️ Mouse RT: ON" : "🖱️ Mouse RT: OFF";
+    }
+
     public string GetModePillText()
     {
         return $"{GetLoopPillText()} • {GetSpeedPillText()}";
@@ -112,6 +119,15 @@ public sealed class CursorLoopSettings
     public void ToggleHeadTrackerOnBar()
     {
         HeadTrackerEnabled = !HeadTrackerEnabled;
+        Save();
+    }
+
+    /// <summary>
+    /// Alterna o modo Função Realtime para controlar o cursor do mouse continuamente com o rosto (X e Y).
+    /// </summary>
+    public void ToggleHeadRealtimeMouseOnBar()
+    {
+        HeadRealtimeMouseEnabled = !HeadRealtimeMouseEnabled;
         Save();
     }
 
@@ -194,9 +210,15 @@ public sealed class CursorLoopSettings
         if (loaded is not null)
         {
             // Sempre iniciar com o teletransporte de borda (Loop ON) ativo ao abrir o aplicativo na maquina do dono
+            // E o modo Função Realtime de controle do mouse sempre começa DESATIVADO ao abrir o app
             loaded.Enabled = true;
             loaded.HorizontalLoop = true;
             loaded.VerticalLoop = true;
+            loaded.HeadRealtimeMouseEnabled = false;
+            if (loaded.HeadRealtimeMouseSpeed <= 0.1)
+            {
+                loaded.HeadRealtimeMouseSpeed = 4.2;
+            }
             if (loaded.HeadConfigVersion < 2)
             {
                 loaded.HeadSensitivity = 2.4;
@@ -217,6 +239,9 @@ public sealed class CursorLoopSettings
             Enabled = true,
             SpeedLevel = 1,
             RealtimeRewriteEnabled = false,
+            HeadTrackerEnabled = false,
+            HeadRealtimeMouseEnabled = false,
+            HeadRealtimeMouseSpeed = 4.2,
             HeadSensitivity = 2.4,
             HeadDistanceBoost = 2.0,
             HeadEnterThreshold = 0.080,
@@ -294,6 +319,17 @@ public sealed class CursorWrapEngine
         _remX = 0;
         _remY = 0;
         _lastWarp = Environment.TickCount64;
+    }
+
+    public void NotifyHeadRealtimeStep(Point newPoint, int stepX, int stepY)
+    {
+        _previous = newPoint;
+        _hasPrevious = true;
+        if (stepX != 0) _lastDx = stepX;
+        if (stepY != 0) _lastDy = stepY;
+        _remX = 0;
+        _remY = 0;
+        _lastWarp = Environment.TickCount64 - 80; // Evita multiplicar por SpeedMultiplier, mas permite atravessar bordas no Loop
     }
 
     public void Tick(bool loopEnabled, bool horizontal, bool vertical)
@@ -783,10 +819,15 @@ public sealed record HeadTrackerTelemetry(
     Rectangle FaceBox,
     double FaceCenterNormX,
     double BaselineX,
+    double FaceCenterNormY,
+    double BaselineY,
     double FeatureCentroidU,
     double BaselineU,
+    double FeatureCentroidV,
+    double BaselineV,
     double RawYawRight,
     double SmoothedYawRight,
+    double SmoothedPitchDown,
     double EnterThreshold,
     double ReturnThreshold,
     double DistanceGainApplied,
@@ -799,9 +840,9 @@ public sealed record HeadTrackerTelemetry(
 
 /// <summary>
 /// Motor nativo em tempo real (Windows.Media.FaceAnalysis + MediaFrameReader + ROI Long-Range Tracker)
-/// que detecta a rotação horizontal do rosto (Yaw para a direita) com alta sensibilidade e compensação
-/// automática de distância, movendo o cursor para o centro do segundo monitor ao virar à direita e
-/// retornando ao centro do monitor principal quando volta a olhar reto.
+/// que opera dois modos combináveis no mesmo recurso:
+/// 1) Monitor Switcher: move o cursor para o centro do 2º monitor ao virar à direita e retorna ao 1º monitor ao olhar reto.
+/// 2) Modo Função Realtime: controla continuamente o cursor do mouse (X e Y) em tempo real com o movimento do rosto.
 /// </summary>
 [System.Runtime.Versioning.SupportedOSPlatform("windows10.0.19041.0")]
 public sealed class HeadMonitorTracker : IDisposable
@@ -817,10 +858,14 @@ public sealed class HeadMonitorTracker : IDisposable
     // Auto-calibração neutra (olhando para o monitor principal ao ativar)
     private int _calibrationSamples;
     private double _calibSumX;
+    private double _calibSumY;
     private double _calibSumU;
+    private double _calibSumV;
     private double _calibSumAsym;
     private double _baselineX = 0.50;
+    private double _baselineY = 0.50;
     private double _baselineU = 0.50;
+    private double _baselineV = 0.50;
     private double _baselineAsym = 0.0;
     private bool _isCalibrated;
 
@@ -828,8 +873,12 @@ public sealed class HeadMonitorTracker : IDisposable
     private Rectangle _lastValidFaceBox;
     private long _lastValidFaceTick;
 
-    // Filtro EMA + Histerese de transição entre Monitor 1 (Reto) e Monitor 2 (Rosto p/ Direita)
+    // Filtro EMA + Histerese de transição + Vetores X/Y para o Modo Realtime Mouse
     private double _smoothedYawRight;
+    private double _smoothedPitchDown;
+    private double _rtRemX;
+    private double _rtRemY;
+    private long _lastRealtimeTick;
     private bool _isLookingRight;
     private int _consecutiveRightFrames;
     private int _consecutiveStraightFrames;
@@ -839,6 +888,7 @@ public sealed class HeadMonitorTracker : IDisposable
     public bool IsRunning => _isRunning;
     public bool IsLookingRight => _isLookingRight;
     public double CurrentYawScore => _smoothedYawRight;
+    public double CurrentPitchScore => _smoothedPitchDown;
     public CursorWrapEngine? WrapEngine { get; set; }
     public CursorLoopSettings? Settings { get; set; }
     public volatile bool IncludePreviewFrame;
@@ -979,14 +1029,83 @@ public sealed class HeadMonitorTracker : IDisposable
     {
         _calibrationSamples = 0;
         _calibSumX = 0;
+        _calibSumY = 0;
         _calibSumU = 0;
+        _calibSumV = 0;
         _calibSumAsym = 0;
         _isCalibrated = false;
         _smoothedYawRight = 0;
+        _smoothedPitchDown = 0;
+        _rtRemX = 0;
+        _rtRemY = 0;
         _isLookingRight = false;
         _consecutiveRightFrames = 0;
         _consecutiveStraightFrames = 0;
         _lastValidFaceTick = 0;
+    }
+
+    /// <summary>
+    /// Chamado a 120 Hz pelo timer principal para mover continuamente o cursor do mouse em tempo real
+    /// com base no giro horizontal (Yaw) e inclinação vertical (Pitch) do rosto quando o Modo Realtime está ativo.
+    /// </summary>
+    public void TickRealtimeCursor()
+    {
+        if (!_isRunning || !_isCalibrated || PauseMouseWarpForTest)
+            return;
+
+        if (!(Settings?.HeadRealtimeMouseEnabled ?? false))
+        {
+            _rtRemX = 0;
+            _rtRemY = 0;
+            return;
+        }
+
+        long now = Environment.TickCount64;
+        if (now - _lastValidFaceTick > 750)
+            return;
+
+        double dt = _lastRealtimeTick == 0 ? 0.008 : Math.Clamp((now - _lastRealtimeTick) / 1000.0, 0.002, 0.050);
+        _lastRealtimeTick = now;
+
+        double yaw = _smoothedYawRight;
+        double pitch = _smoothedPitchDown;
+        double mag = Math.Sqrt(yaw * yaw + pitch * pitch);
+
+        // Zona morta central (Deadzone) para manter o cursor 100% firme ao mirar ou clicar
+        const double deadzone = 0.014;
+        if (mag <= deadzone)
+        {
+            _rtRemX = 0;
+            _rtRemY = 0;
+            return;
+        }
+
+        double activeMag = mag - deadzone;
+        double dirX = yaw / mag;
+        double dirY = pitch / mag;
+
+        double speedSetting = Math.Clamp(Settings?.HeadRealtimeMouseSpeed ?? 4.2, 0.5, 12.0);
+        double pixelsPerSec = (activeMag * 980.0 + Math.Pow(activeMag, 1.65) * 4400.0) * speedSetting;
+
+        double deltaX = (dirX * pixelsPerSec * dt) + _rtRemX;
+        double deltaY = (dirY * pixelsPerSec * dt * 1.25) + _rtRemY; // 1.25x compensação de amplitude vertical do pescoço
+
+        int moveX = (int)Math.Truncate(deltaX);
+        int moveY = (int)Math.Truncate(deltaY);
+        _rtRemX = deltaX - moveX;
+        _rtRemY = deltaY - moveY;
+
+        if (moveX == 0 && moveY == 0)
+            return;
+
+        try
+        {
+            Point cur = Cursor.Position;
+            Point next = new(cur.X + moveX, cur.Y + moveY);
+            Cursor.Position = next;
+            WrapEngine?.NotifyHeadRealtimeStep(Cursor.Position, moveX, moveY);
+        }
+        catch { }
     }
 
     public async Task StopAsync()
@@ -1113,9 +1232,14 @@ public sealed class HeadMonitorTracker : IDisposable
                             0.5,
                             _baselineX,
                             0.5,
+                            _baselineY,
+                            0.5,
                             _baselineU,
+                            0.5,
+                            _baselineV,
                             0,
                             _smoothedYawRight,
+                            _smoothedPitchDown,
                             Settings?.HeadEnterThreshold ?? 0.080,
                             Settings?.HeadReturnThreshold ?? 0.032,
                             1.0,
@@ -1130,9 +1254,11 @@ public sealed class HeadMonitorTracker : IDisposable
                 }
 
                 double faceCenterNormX = (activeBox.X + 0.5 * activeBox.Width) / frameW;
+                double faceCenterNormY = (activeBox.Y + 0.5 * activeBox.Height) / frameH;
                 double faceWidthNorm = Math.Max(0.06, (double)activeBox.Width / frameW);
+                double faceHeightNorm = Math.Max(0.08, (double)activeBox.Height / frameH);
 
-                var (featureCentroidU, cheekGradAsym) = ComputeInternalFaceYawFeatures(
+                var (featureCentroidU, featureCentroidV, cheekGradAsym) = ComputeInternalFaceYawFeatures(
                     _pixelBuffer,
                     frameW,
                     frameH,
@@ -1159,7 +1285,9 @@ public sealed class HeadMonitorTracker : IDisposable
                     if (!usedFallbackRoi)
                     {
                         _calibSumX += faceCenterNormX;
+                        _calibSumY += faceCenterNormY;
                         _calibSumU += featureCentroidU;
+                        _calibSumV += featureCentroidV;
                         _calibSumAsym += cheekGradAsym;
                         _calibrationSamples++;
                     }
@@ -1167,10 +1295,12 @@ public sealed class HeadMonitorTracker : IDisposable
                     if (_calibrationSamples >= 5)
                     {
                         _baselineX = _calibSumX / _calibrationSamples;
+                        _baselineY = _calibSumY / _calibrationSamples;
                         _baselineU = _calibSumU / _calibrationSamples;
+                        _baselineV = _calibSumV / _calibrationSamples;
                         _baselineAsym = _calibSumAsym / _calibrationSamples;
                         _isCalibrated = true;
-                        OnStateUpdated?.Invoke("👀 HEAD TRACKER CALIBRADO • Vire o rosto à direita p/ ir ao 2º monitor", false, 0);
+                        OnStateUpdated?.Invoke("👀 HEAD TRACKER CALIBRADO • Pronto p/ Monitor Switcher e Modo Realtime", false, 0);
                     }
 
                     if (IncludePreviewFrame)
@@ -1184,8 +1314,13 @@ public sealed class HeadMonitorTracker : IDisposable
                             activeBox,
                             faceCenterNormX,
                             _baselineX,
+                            faceCenterNormY,
+                            _baselineY,
                             featureCentroidU,
                             _baselineU,
+                            featureCentroidV,
+                            _baselineV,
+                            0,
                             0,
                             0,
                             enterThreshold,
@@ -1211,13 +1346,28 @@ public sealed class HeadMonitorTracker : IDisposable
                 double rawYawRight = baseYawSignal * (totalGain * 0.55);
                 _smoothedYawRight = (alpha * rawYawRight) + ((1.0 - alpha) * _smoothedYawRight);
 
-                // Adaptação lenta de postura neutra quando o usuário está olhando reto para o monitor principal
-                if (!_isLookingRight && !usedFallbackRoi && Math.Abs(rawYawRight) < returnThreshold * 0.75)
+                // Inclinação vertical (Pitch Down = positivo / Up = negativo) para o Modo Função Realtime do Mouse
+                double posShiftDown = (faceCenterNormY - _baselineY) / Math.Max(0.10, faceHeightNorm);
+                double featShiftDown = featureCentroidV - _baselineV;
+                double basePitchSignal = (0.85 * posShiftDown) + (3.60 * featShiftDown);
+                double rawPitchDown = basePitchSignal * (totalGain * 0.60);
+                _smoothedPitchDown = (alpha * rawPitchDown) + ((1.0 - alpha) * _smoothedPitchDown);
+
+                // Adaptação lenta de postura neutra quando o usuário está olhando reto (apenas se o modo Realtime contínuo estiver desligado)
+                if (!(Settings?.HeadRealtimeMouseEnabled ?? false) &&
+                    !_isLookingRight &&
+                    !usedFallbackRoi &&
+                    Math.Abs(rawYawRight) < returnThreshold * 0.75)
                 {
                     _baselineX = (0.988 * _baselineX) + (0.012 * faceCenterNormX);
+                    _baselineY = (0.988 * _baselineY) + (0.012 * faceCenterNormY);
                     _baselineU = (0.988 * _baselineU) + (0.012 * featureCentroidU);
+                    _baselineV = (0.988 * _baselineV) + (0.012 * featureCentroidV);
                     _baselineAsym = (0.988 * _baselineAsym) + (0.012 * cheekGradAsym);
                 }
+
+                bool monitorSwitchEnabled = Settings?.HeadTrackerEnabled ?? false;
+                bool realtimeMouseEnabled = Settings?.HeadRealtimeMouseEnabled ?? false;
 
                 string statusMsg;
                 if (!_isLookingRight)
@@ -1230,11 +1380,13 @@ public sealed class HeadMonitorTracker : IDisposable
                             _isLookingRight = true;
                             _consecutiveRightFrames = 0;
                             _consecutiveStraightFrames = 0;
-                            if (!PauseMouseWarpForTest)
+                            if (monitorSwitchEnabled && !PauseMouseWarpForTest)
                             {
                                 WarpCursorToMonitorCenter(secondaryMonitor: true);
                             }
-                            statusMsg = $"👀 ROSTO P/ DIREITA ({_smoothedYawRight:0.000}) ➔ Mouse no Centro do 2º Monitor";
+                            statusMsg = realtimeMouseEnabled
+                                ? $"🖱️ MOUSE RT ATIVO (X:{_smoothedYawRight:+0.00;-0.00} Y:{_smoothedPitchDown:+0.00;-0.00}) • 2º Monitor"
+                                : $"👀 ROSTO P/ DIREITA ({_smoothedYawRight:0.000}) ➔ Mouse no Centro do 2º Monitor";
                             OnStateUpdated?.Invoke(statusMsg, true, _smoothedYawRight);
                         }
                         else
@@ -1245,7 +1397,9 @@ public sealed class HeadMonitorTracker : IDisposable
                     else
                     {
                         _consecutiveRightFrames = 0;
-                        statusMsg = $"🟢 OLHANDO RETO (1º Monitor) • Sinal: {_smoothedYawRight:0.000} / Limiar: {enterThreshold:0.000}";
+                        statusMsg = realtimeMouseEnabled
+                            ? $"🖱️ MOUSE RT ATIVO (X:{_smoothedYawRight:+0.00;-0.00} Y:{_smoothedPitchDown:+0.00;-0.00})"
+                            : $"🟢 OLHANDO RETO (1º Monitor) • Sinal: {_smoothedYawRight:0.000} / Limiar: {enterThreshold:0.000}";
                     }
                 }
                 else
@@ -1258,11 +1412,13 @@ public sealed class HeadMonitorTracker : IDisposable
                             _isLookingRight = false;
                             _consecutiveStraightFrames = 0;
                             _consecutiveRightFrames = 0;
-                            if (!PauseMouseWarpForTest && returnToPrimary)
+                            if (monitorSwitchEnabled && !PauseMouseWarpForTest && returnToPrimary)
                             {
                                 WarpCursorToMonitorCenter(secondaryMonitor: false);
                             }
-                            statusMsg = $"👀 ROSTO RETO ({_smoothedYawRight:0.000}) ➔ Mouse no Centro do 1º Monitor";
+                            statusMsg = realtimeMouseEnabled
+                                ? $"🖱️ MOUSE RT ATIVO (X:{_smoothedYawRight:+0.00;-0.00} Y:{_smoothedPitchDown:+0.00;-0.00}) • 1º Monitor"
+                                : $"👀 ROSTO RETO ({_smoothedYawRight:0.000}) ➔ Mouse no Centro do 1º Monitor";
                             OnStateUpdated?.Invoke(statusMsg, false, _smoothedYawRight);
                         }
                         else
@@ -1273,7 +1429,9 @@ public sealed class HeadMonitorTracker : IDisposable
                     else
                     {
                         _consecutiveStraightFrames = 0;
-                        statusMsg = $"🎯 ATIVO NO 2º MONITOR (Rosto à Direita) • Sinal: {_smoothedYawRight:0.000}";
+                        statusMsg = realtimeMouseEnabled
+                            ? $"🖱️ MOUSE RT ATIVO NO 2º MONITOR (X:{_smoothedYawRight:+0.00;-0.00} Y:{_smoothedPitchDown:+0.00;-0.00})"
+                            : $"🎯 ATIVO NO 2º MONITOR (Rosto à Direita) • Sinal: {_smoothedYawRight:0.000}";
                     }
                 }
 
@@ -1288,10 +1446,15 @@ public sealed class HeadMonitorTracker : IDisposable
                         activeBox,
                         faceCenterNormX,
                         _baselineX,
+                        faceCenterNormY,
+                        _baselineY,
                         featureCentroidU,
                         _baselineU,
+                        featureCentroidV,
+                        _baselineV,
                         rawYawRight,
                         _smoothedYawRight,
+                        _smoothedPitchDown,
                         enterThreshold,
                         returnThreshold,
                         distanceGain,
@@ -1363,10 +1526,10 @@ public sealed class HeadMonitorTracker : IDisposable
     }
 
     /// <summary>
-    /// Calcula o centroide horizontal das feições internas (olhos, nariz e boca) e a assimetria de gradiente
-    /// entre as metades da face. Usa passo de 1px automaticamente quando o rosto está distante (boxW < 110).
+    /// Calcula o centroide horizontal (U) e vertical (V) das feições internas (olhos, nariz e boca)
+    /// e a assimetria de gradiente entre as metades da face. Usa passo de 1px automaticamente quando o rosto está distante (boxW < 110).
     /// </summary>
-    private static (double FeatureCentroidU, double CheekGradAsym) ComputeInternalFaceYawFeatures(
+    private static (double FeatureCentroidU, double FeatureCentroidV, double CheekGradAsym) ComputeInternalFaceYawFeatures(
         byte[] grayPixels,
         int frameW,
         int frameH,
@@ -1381,7 +1544,7 @@ public sealed class HeadMonitorTracker : IDisposable
         int y1 = Math.Clamp(boxY + (int)(boxH * 0.80), 1, frameH - 2);
 
         if (x1 <= x0 + 3 || y1 <= y0 + 3)
-            return (0.50, 0.0);
+            return (0.50, 0.50, 0.0);
 
         // Quando o usuário está mais distante da câmera (rosto menor), analisa pixel a pixel (step = 1) para máxima precisão!
         int step = boxW < 110 ? 1 : 2;
@@ -1400,6 +1563,7 @@ public sealed class HeadMonitorTracker : IDisposable
 
         double meanLum = count > 0 ? (double)lumSum / count : 128.0;
         double weightedUSum = 0.0;
+        double weightedVSum = 0.0;
         double weightSum = 0.0;
         double leftHalfGrad = 0.0;
         double rightHalfGrad = 0.0;
@@ -1410,6 +1574,7 @@ public sealed class HeadMonitorTracker : IDisposable
             int rowOffset = y * frameW;
             int prevRow = (y - 1) * frameW;
             int nextRow = (y + 1) * frameW;
+            double v = (double)(y - boxY) / boxH;
 
             for (int x = x0; x <= x1; x += step)
             {
@@ -1423,6 +1588,7 @@ public sealed class HeadMonitorTracker : IDisposable
                 double u = (double)(x - boxX) / boxW;
 
                 weightedUSum += u * weight;
+                weightedVSum += v * weight;
                 weightSum += weight;
 
                 if (x < midX)
@@ -1433,8 +1599,9 @@ public sealed class HeadMonitorTracker : IDisposable
         }
 
         double centroidU = weightSum > 1e-3 ? (weightedUSum / weightSum) : 0.50;
+        double centroidV = weightSum > 1e-3 ? (weightedVSum / weightSum) : 0.50;
         double asym = (leftHalfGrad - rightHalfGrad) / (leftHalfGrad + rightHalfGrad + 1.0);
-        return (centroidU, asym);
+        return (centroidU, centroidV, asym);
     }
 
     public void ForceTestWarp(bool secondaryMonitor)
@@ -1500,6 +1667,7 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
     private readonly HeadMonitorTracker _tracker;
     private readonly CursorLoopSettings _settings;
     private readonly Func<Task> _onToggleEnabledChanged;
+    private readonly Func<Task>? _onToggleRealtimeMouseChanged;
 
     private readonly System.Windows.Controls.Image _cameraImage;
     private readonly System.Windows.Controls.Canvas _overlayCanvas;
@@ -1520,8 +1688,11 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
     private readonly System.Windows.Controls.TextBlock _thresholdValueText;
     private readonly System.Windows.Controls.Slider _smoothingSlider;
     private readonly System.Windows.Controls.TextBlock _smoothingValueText;
+    private readonly System.Windows.Controls.Slider _realtimeSpeedSlider;
+    private readonly System.Windows.Controls.TextBlock _realtimeSpeedValueText;
 
     private readonly System.Windows.Controls.CheckBox _enableTrackerCheck;
+    private readonly System.Windows.Controls.CheckBox _enableRealtimeMouseCheck;
     private readonly System.Windows.Controls.CheckBox _returnPrimaryCheck;
     private readonly System.Windows.Controls.CheckBox _hdLongDistanceCheck;
     private readonly System.Windows.Controls.CheckBox _pauseWarpCheck;
@@ -1533,17 +1704,19 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
     public HeadTrackerConfigWindow(
         HeadMonitorTracker tracker,
         CursorLoopSettings settings,
-        Func<Task> onToggleEnabledChanged)
+        Func<Task> onToggleEnabledChanged,
+        Func<Task>? onToggleRealtimeMouseChanged = null)
     {
         _tracker = tracker;
         _settings = settings;
         _onToggleEnabledChanged = onToggleEnabledChanged;
+        _onToggleRealtimeMouseChanged = onToggleRealtimeMouseChanged;
 
-        Title = "🎯 Teste e Configuração — Head Motion Monitor (Sensibilidade e Longa Distância)";
-        Width = 780;
-        Height = 650;
-        MinWidth = 720;
-        MinHeight = 600;
+        Title = "🎯 Teste e Configuração — Head Motion Monitor + Controle Realtime do Mouse";
+        Width = 800;
+        Height = 710;
+        MinWidth = 740;
+        MinHeight = 640;
         WindowStartupLocation = System.Windows.WindowStartupLocation.CenterScreen;
         Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(11, 11, 14));
         Foreground = System.Windows.Media.Brushes.White;
@@ -1812,12 +1985,30 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
                 _settings.Save();
             });
 
+        (_realtimeSpeedSlider, _realtimeSpeedValueText) = AddSliderRow(
+            slidersStack,
+            "5. Velocidade do Cursor no Modo Função Realtime (Controlar o mouse continuamente com o rosto):",
+            1.0, 10.0, _settings.HeadRealtimeMouseSpeed, "0.0x",
+            val =>
+            {
+                _settings.HeadRealtimeMouseSpeed = Math.Round(val, 1);
+                _settings.Save();
+            });
+
         // Checkboxes de configuração
         _enableTrackerCheck = CreateCheckBox(
             "☑ Ativar modo Head Motion Monitor (Mover mouse p/ centro do 2º monitor ao virar o rosto à direita)",
             _settings.HeadTrackerEnabled);
         _enableTrackerCheck.Checked += async (_, _) => await HandleEnableCheckChangedAsync(true);
         _enableTrackerCheck.Unchecked += async (_, _) => await HandleEnableCheckChangedAsync(false);
+
+        _enableRealtimeMouseCheck = CreateCheckBox(
+            "🖱️ Ativar Modo Função Realtime para Controlar o Mouse com o Rosto (X e Y contínuo • Começa Desativado)",
+            _settings.HeadRealtimeMouseEnabled);
+        _enableRealtimeMouseCheck.FontWeight = System.Windows.FontWeights.SemiBold;
+        _enableRealtimeMouseCheck.Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(56, 189, 248));
+        _enableRealtimeMouseCheck.Checked += async (_, _) => await HandleRealtimeMouseCheckChangedAsync(true);
+        _enableRealtimeMouseCheck.Unchecked += async (_, _) => await HandleRealtimeMouseCheckChangedAsync(false);
 
         _returnPrimaryCheck = CreateCheckBox(
             "☑ Retornar automaticamente o mouse p/ o centro do 1º monitor quando voltar a olhar reto",
@@ -1838,6 +2029,7 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
         _pauseWarpCheck.Unchecked += (_, _) => _tracker.PauseMouseWarpForTest = false;
 
         slidersStack.Children.Add(_enableTrackerCheck);
+        slidersStack.Children.Add(_enableRealtimeMouseCheck);
         slidersStack.Children.Add(_returnPrimaryCheck);
         slidersStack.Children.Add(_hdLongDistanceCheck);
         slidersStack.Children.Add(_pauseWarpCheck);
@@ -1867,11 +2059,25 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
             _tracker.PauseMouseWarpForTest = false;
             _tracker.OnTelemetryFrame -= HandleTelemetryFrame;
 
-            if (_startedTempPreview && !_settings.HeadTrackerEnabled)
+            if (_startedTempPreview && !_settings.HeadTrackerEnabled && !_settings.HeadRealtimeMouseEnabled)
             {
                 await _tracker.StopAsync();
             }
         };
+    }
+
+    public void SyncCheckboxesFromSettings()
+    {
+        _suppressEvents = true;
+        try
+        {
+            _enableTrackerCheck.IsChecked = _settings.HeadTrackerEnabled;
+            _enableRealtimeMouseCheck.IsChecked = _settings.HeadRealtimeMouseEnabled;
+        }
+        finally
+        {
+            _suppressEvents = false;
+        }
     }
 
     private async Task HandleEnableCheckChangedAsync(bool enabled)
@@ -1883,6 +2089,31 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
         {
             _startedTempPreview = false;
             await _onToggleEnabledChanged();
+            if (!_tracker.IsRunning)
+            {
+                _startedTempPreview = true;
+                await _tracker.StartAsync();
+            }
+        }
+    }
+
+    private async Task HandleRealtimeMouseCheckChangedAsync(bool enabled)
+    {
+        if (_suppressEvents)
+            return;
+
+        if (_settings.HeadRealtimeMouseEnabled != enabled)
+        {
+            _startedTempPreview = false;
+            if (_onToggleRealtimeMouseChanged != null)
+            {
+                await _onToggleRealtimeMouseChanged();
+            }
+            else
+            {
+                _settings.ToggleHeadRealtimeMouseOnBar();
+            }
+
             if (!_tracker.IsRunning)
             {
                 _startedTempPreview = true;
@@ -2019,7 +2250,7 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
                 _gaugeThresholdMarker.Margin = new System.Windows.Thickness(threshRatio * trackW, 0, 0, 0);
 
                 _telemetryDetailText.Text =
-                    $"Sinal Atual: {t.SmoothedYawRight:+0.000;-0.000;0.000}  |  Limiar Disparo: +{t.EnterThreshold:0.000}  |  Retorno: +{t.ReturnThreshold:0.000}";
+                    $"X (Giro): {t.SmoothedYawRight:+0.000;-0.000;0.000} | Y (Vertical): {t.SmoothedPitchDown:+0.000;-0.000;0.000} | Limiar 2º Mon: +{t.EnterThreshold:0.000} | Mouse RT: {(_settings.HeadRealtimeMouseEnabled ? "ATIVO" : "OFF")}";
             }
             catch { }
         });
@@ -2033,7 +2264,7 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
 
         // Como a imagem está espelhada horizontalmente (ScaleX = -1), a coordenada X espelhada na tela é (1.0 - normX) * cw
         double mirroredBaseX = (1.0 - t.BaselineX) * cw;
-        var baseLine = new System.Windows.Shapes.Line
+        var baseLineX = new System.Windows.Shapes.Line
         {
             X1 = mirroredBaseX,
             Y1 = 0,
@@ -2043,7 +2274,20 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
             StrokeThickness = 1.5,
             StrokeDashArray = new System.Windows.Media.DoubleCollection { 4, 3 }
         };
-        _overlayCanvas.Children.Add(baseLine);
+        _overlayCanvas.Children.Add(baseLineX);
+
+        double baseY = t.BaselineY * ch;
+        var baseLineY = new System.Windows.Shapes.Line
+        {
+            X1 = 0,
+            Y1 = baseY,
+            X2 = cw,
+            Y2 = baseY,
+            Stroke = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(120, 148, 163, 184)),
+            StrokeThickness = 1.2,
+            StrokeDashArray = new System.Windows.Media.DoubleCollection { 4, 3 }
+        };
+        _overlayCanvas.Children.Add(baseLineY);
 
         if (!t.FaceDetected || t.FaceBox.Width <= 0 || t.FrameWidth <= 0 || t.FrameHeight <= 0)
             return;
@@ -2076,9 +2320,9 @@ public sealed class HeadTrackerConfigWindow : System.Windows.Window
         System.Windows.Controls.Canvas.SetTop(rect, boxTop);
         _overlayCanvas.Children.Add(rect);
 
-        // Ponto do centroide do nariz/feições espelhado
+        // Ponto 2D do centroide do nariz/feições espelhado (X e Y)
         double noseMirroredX = mirroredLeft + (1.0 - t.FeatureCentroidU) * boxW;
-        double noseY = boxTop + (boxH * 0.52);
+        double noseY = boxTop + (t.FeatureCentroidV * boxH);
         var noseDot = new System.Windows.Shapes.Ellipse
         {
             Width = 9,

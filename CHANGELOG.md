@@ -4,6 +4,14 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.8] — 26/10/2026
+
+- Modo Funcao Realtime para controlar o mouse pelo rosto (X e Y continuo em 120 Hz com zona morta central e aceleracao progressiva)
+- Botao 'Mouse RT: OFF / ON' na barra, no menu da bandeja e na tela de Configuracao
+- Sempre inicia desativado por seguranca (HeadRealtimeMouseEnabled = false na abertura)
+
+---
+
 ## [v1.3.7] — 26/10/2026
 
 - **Tela de Teste ao Vivo e Configuração do Head Motion (🎯 Config):** Visor espelhado da webcam em tempo real com marcação do rosto e nariz, medidor visual de giro (Yaw) com marcador de limiar e botões de recalibração e teste imediato dos monitores.

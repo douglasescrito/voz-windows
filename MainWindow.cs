@@ -52,6 +52,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock _livePreviewText;
     private readonly Button _rewriteToggleButton;
     private readonly Button _headTrackerButton;
+    private readonly Button _headRealtimeMouseButton;
     private readonly Button _headConfigButton;
     private readonly Button _cursorLoopButton;
     private readonly Button _cursorSpeedButton;
@@ -292,9 +293,16 @@ public sealed class MainWindow : Window
         _headTrackerButton.Click += async (_, _) => await ToggleHeadTrackerOnBarAsync();
         _headTrackerButton.MouseRightButtonUp += (_, _) => OpenHeadTrackerConfigWindow();
 
+        _headRealtimeMouseButton = CreateSmallActionButton(
+            _cursorSettings.GetHeadRealtimeMousePillText(),
+            "Modo Função Realtime para controlar o mouse pelo rosto (X e Y contínuo • Começa Desativado • Clique direito abre Config)");
+        _headRealtimeMouseButton.Foreground = _cursorSettings.HeadRealtimeMouseEnabled ? BrushGreenReady : BrushMutedGray;
+        _headRealtimeMouseButton.Click += async (_, _) => await ToggleHeadRealtimeMouseOnBarAsync();
+        _headRealtimeMouseButton.MouseRightButtonUp += (_, _) => OpenHeadTrackerConfigWindow();
+
         _headConfigButton = CreateSmallActionButton(
             "🎯 Config",
-            "Abrir Tela de Teste ao Vivo e Configuração de Sensibilidade / Longa Distância do Head Motion Monitor");
+            "Abrir Tela de Teste ao Vivo e Configuração de Sensibilidade / Longa Distância / Mouse Realtime do Head Motion Monitor");
         _headConfigButton.Foreground = BrushSkyBlue;
         _headConfigButton.Click += (_, _) => OpenHeadTrackerConfigWindow();
 
@@ -313,6 +321,7 @@ public sealed class MainWindow : Window
         if (!CursorLoopSettings.IsCursorLoopSupported)
         {
             _headTrackerButton.Visibility = Visibility.Collapsed;
+            _headRealtimeMouseButton.Visibility = Visibility.Collapsed;
             _headConfigButton.Visibility = Visibility.Collapsed;
             _cursorLoopButton.Visibility = Visibility.Collapsed;
             _cursorSpeedButton.Visibility = Visibility.Collapsed;
@@ -326,6 +335,7 @@ public sealed class MainWindow : Window
 
         actionsPanel.Children.Add(_rewriteToggleButton);
         actionsPanel.Children.Add(_headTrackerButton);
+        actionsPanel.Children.Add(_headRealtimeMouseButton);
         actionsPanel.Children.Add(_headConfigButton);
         actionsPanel.Children.Add(_cursorLoopButton);
         actionsPanel.Children.Add(_cursorSpeedButton);
@@ -340,11 +350,12 @@ public sealed class MainWindow : Window
         _outerBorder.Child = rootMorphGrid;
         Content = _outerBorder;
 
-        // 8ms (~120 FPS) Engine Timer: CursorLoop (only on owner machine) + Active Target Tracker
+        // 8ms (~120 FPS) Engine Timer: Head Realtime Mouse + CursorLoop (only on owner machine) + Active Target Tracker
         _cursorTimer.Tick += (_, _) =>
         {
             if (CursorLoopSettings.IsCursorLoopSupported)
             {
+                _headTracker.TickRealtimeCursor();
                 _cursorEngine.Tick(_cursorSettings.Enabled, _cursorSettings.HorizontalLoop, _cursorSettings.VerticalLoop);
             }
             TrackActiveExternalWindow();
@@ -536,9 +547,10 @@ public sealed class MainWindow : Window
         if (CursorLoopSettings.IsCursorLoopSupported)
         {
             _cursorSettings.Enabled = true;
+            _cursorSettings.HeadRealtimeMouseEnabled = false; // Always starts disabled on startup
             _cursorSettings.Save();
             ApplyCursorLoopToBar();
-            if (_cursorSettings.HeadTrackerEnabled)
+            if (_cursorSettings.HeadTrackerEnabled || _cursorSettings.HeadRealtimeMouseEnabled)
             {
                 _ = _headTracker.StartAsync();
             }
@@ -1494,7 +1506,8 @@ public sealed class MainWindow : Window
         _headConfigWindow = new HeadTrackerConfigWindow(
             _headTracker,
             _cursorSettings,
-            async () => await ToggleHeadTrackerOnBarAsync());
+            async () => await ToggleHeadTrackerOnBarAsync(),
+            async () => await ToggleHeadRealtimeMouseOnBarAsync());
         _headConfigWindow.Closed += (_, _) => _headConfigWindow = null;
         _headConfigWindow.Show();
         _headConfigWindow.Activate();
@@ -1507,23 +1520,72 @@ public sealed class MainWindow : Window
 
         _headTrackerButton.Content = _cursorSettings.GetHeadTrackerPillText();
         _headTrackerButton.Foreground = enabled ? BrushGreenReady : new SolidColorBrush(Color.FromRgb(148, 163, 184));
+        _headConfigWindow?.SyncCheckboxesFromSettings();
 
-        if (enabled)
+        bool anyHeadModeActive = _cursorSettings.HeadTrackerEnabled || _cursorSettings.HeadRealtimeMouseEnabled;
+        if (anyHeadModeActive)
         {
             if (!_isListening)
             {
                 _statusDot.Fill = BrushGreenReady;
-                _statusText.Text = "👀 INICIANDO HEAD TRACKER (WEBCAM) • Olhe para o monitor principal para calibrar...";
+                _statusText.Text = enabled
+                    ? "👀 HEAD TRACKER (2º MONITOR) ATIVO • Olhe para o monitor principal para calibrar..."
+                    : "🖱️ MODO FUNÇÃO REALTIME DO MOUSE PELO ROSTO CONTINUA ATIVO";
             }
             await _headTracker.StartAsync();
         }
         else
         {
-            await _headTracker.StopAsync();
+            if (_headConfigWindow == null)
+            {
+                await _headTracker.StopAsync();
+            }
             if (!_isListening)
             {
                 _statusDot.Fill = BrushSkyBlue;
                 _statusText.Text = "👀 HEAD TRACKER DESATIVADO • Câmera desligada";
+            }
+        }
+        UpdateTrayTooltip();
+    }
+
+    public async Task ToggleHeadRealtimeMouseOnBarAsync()
+    {
+        _cursorSettings.ToggleHeadRealtimeMouseOnBar();
+        bool rtEnabled = _cursorSettings.HeadRealtimeMouseEnabled;
+
+        _headRealtimeMouseButton.Content = _cursorSettings.GetHeadRealtimeMousePillText();
+        _headRealtimeMouseButton.Foreground = rtEnabled ? BrushGreenReady : new SolidColorBrush(Color.FromRgb(148, 163, 184));
+        _headConfigWindow?.SyncCheckboxesFromSettings();
+
+        bool anyHeadModeActive = _cursorSettings.HeadTrackerEnabled || _cursorSettings.HeadRealtimeMouseEnabled;
+        if (rtEnabled)
+        {
+            if (!_isListening)
+            {
+                _statusDot.Fill = BrushGreenReady;
+                _statusText.Text = $"🖱️ MODO FUNÇÃO REALTIME DO MOUSE ATIVADO ({_cursorSettings.HeadRealtimeMouseSpeed:0.0}x) • Mova o rosto p/ guiar o cursor";
+            }
+            await _headTracker.StartAsync();
+        }
+        else if (anyHeadModeActive)
+        {
+            if (!_isListening)
+            {
+                _statusDot.Fill = BrushSkyBlue;
+                _statusText.Text = "🖱️ MOUSE REALTIME DESATIVADO • (Modo Salto p/ 2º Monitor continua ativo)";
+            }
+        }
+        else
+        {
+            if (_headConfigWindow == null)
+            {
+                await _headTracker.StopAsync();
+            }
+            if (!_isListening)
+            {
+                _statusDot.Fill = BrushSkyBlue;
+                _statusText.Text = "🖱️ MOUSE REALTIME E HEAD TRACKER DESATIVADOS • Câmera desligada";
             }
         }
         UpdateTrayTooltip();
@@ -1561,6 +1623,11 @@ public sealed class MainWindow : Window
 
         _headTrackerButton.Content = _cursorSettings.GetHeadTrackerPillText();
         _headTrackerButton.Foreground = _cursorSettings.HeadTrackerEnabled
+            ? BrushGreenReady
+            : new SolidColorBrush(Color.FromRgb(148, 163, 184));
+
+        _headRealtimeMouseButton.Content = _cursorSettings.GetHeadRealtimeMousePillText();
+        _headRealtimeMouseButton.Foreground = _cursorSettings.HeadRealtimeMouseEnabled
             ? BrushGreenReady
             : new SolidColorBrush(Color.FromRgb(148, 163, 184));
 
@@ -1776,7 +1843,8 @@ public sealed class MainWindow : Window
         {
             menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
             menu.Items.Add("👀 Alternar Mouse p/ Centro do 2º Monitor pelo Rosto (Head ON / OFF)", null, (_, _) => Dispatcher.BeginInvoke(async () => await ToggleHeadTrackerOnBarAsync()));
-            menu.Items.Add("🎯 Configurar e Testar Head Tracking (Sensibilidade e Distância)...", null, (_, _) => Dispatcher.BeginInvoke(OpenHeadTrackerConfigWindow));
+            menu.Items.Add("🖱️ Alternar Modo Função Realtime do Mouse pelo Rosto (Mouse RT ON / OFF)", null, (_, _) => Dispatcher.BeginInvoke(async () => await ToggleHeadRealtimeMouseOnBarAsync()));
+            menu.Items.Add("🎯 Configurar e Testar Head Tracking (Sensibilidade e Mouse Realtime)...", null, (_, _) => Dispatcher.BeginInvoke(OpenHeadTrackerConfigWindow));
             menu.Items.Add("🟢 Alternar Repetição de Borda (Loop ON / OFF)", null, (_, _) => Dispatcher.BeginInvoke(ToggleCursorLoopOnlyOnBar));
             menu.Items.Add("⚡ Alternar Velocidade do Cursor (Ciclo)", null, (_, _) => Dispatcher.BeginInvoke(CycleCursorSpeedOnlyOnBar));
             menu.Items.Add("   • Velocidade Nível 1 (1.8x) [Ctrl+Alt+1]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(1)));
