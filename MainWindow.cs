@@ -29,8 +29,9 @@ public sealed class MainWindow : Window
     private readonly GeminiRewriteClient _rewriter = new();
     private readonly RewriteDeckView _rewriteDeck = new();
 
-    // Integrated Module 2: CursorLoop (Touchpad Booster + Infinite Monitor Edges)
+    // Integrated Module 2: CursorLoop (Touchpad Booster + Infinite Monitor Edges + Head Motion Monitor Switcher)
     private readonly CursorWrapEngine _cursorEngine = new();
+    private readonly HeadMonitorTracker _headTracker = new();
     private readonly CursorLoopSettings _cursorSettings;
     private readonly System.Windows.Forms.Timer _cursorTimer = new() { Interval = 8 };
 
@@ -50,6 +51,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock _statusText;
     private readonly TextBlock _livePreviewText;
     private readonly Button _rewriteToggleButton;
+    private readonly Button _headTrackerButton;
     private readonly Button _cursorLoopButton;
     private readonly Button _cursorSpeedButton;
     private readonly Button _minButton;
@@ -114,6 +116,7 @@ public sealed class MainWindow : Window
         _cursorSettings = CursorLoopSettings.Load();
         _cursorEngine.SpeedMultiplier = _cursorSettings.GetEffectiveMultiplier();
         _cursorEngine.SmartPrecision = _cursorSettings.SmartPrecision;
+        _headTracker.WrapEngine = _cursorEngine;
 
         if (!string.IsNullOrEmpty(Environment.ProcessPath))
         {
@@ -279,6 +282,12 @@ public sealed class MainWindow : Window
         _rewriteToggleButton.Click += (_, _) => ToggleRealtimeRewriteMode();
         _rewriteDeck.SetRealtimeRewriteMode(_cursorSettings.RealtimeRewriteEnabled);
 
+        _headTrackerButton = CreateSmallActionButton(
+            _cursorSettings.GetHeadTrackerPillText(),
+            "Alternar Head Motion Detection: move o mouse para o centro do 2º monitor quando o rosto vira para a direita em tempo real");
+        _headTrackerButton.Foreground = _cursorSettings.HeadTrackerEnabled ? BrushGreenReady : BrushMutedGray;
+        _headTrackerButton.Click += async (_, _) => await ToggleHeadTrackerOnBarAsync();
+
         _cursorLoopButton = CreateSmallActionButton(
             _cursorSettings.GetLoopPillText(),
             "Alternar repetição de borda (Loop ON / OFF) de forma independente da velocidade");
@@ -293,6 +302,7 @@ public sealed class MainWindow : Window
 
         if (!CursorLoopSettings.IsCursorLoopSupported)
         {
+            _headTrackerButton.Visibility = Visibility.Collapsed;
             _cursorLoopButton.Visibility = Visibility.Collapsed;
             _cursorSpeedButton.Visibility = Visibility.Collapsed;
         }
@@ -304,6 +314,7 @@ public sealed class MainWindow : Window
         closeButton.Click += (_, _) => MinimizeToTray();
 
         actionsPanel.Children.Add(_rewriteToggleButton);
+        actionsPanel.Children.Add(_headTrackerButton);
         actionsPanel.Children.Add(_cursorLoopButton);
         actionsPanel.Children.Add(_cursorSpeedButton);
         actionsPanel.Children.Add(closeButton);
@@ -330,6 +341,18 @@ public sealed class MainWindow : Window
 
         // Start background listener for IPC events (--cursorloop, Start Menu click)
         StartIpcSignalListener();
+
+        _headTracker.OnStateUpdated += (statusMsg, lookingRight, _) =>
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                if (!_isListening)
+                {
+                    _statusDot.Fill = lookingRight ? BrushGreenReady : BrushSkyBlue;
+                    _statusText.Text = statusMsg;
+                }
+            });
+        };
 
         // Wire embedded RewriteDeckView callbacks
         _rewriter.OnVariationsUpdated += variations =>
@@ -503,6 +526,10 @@ public sealed class MainWindow : Window
             _cursorSettings.Enabled = true;
             _cursorSettings.Save();
             ApplyCursorLoopToBar();
+            if (_cursorSettings.HeadTrackerEnabled)
+            {
+                _ = _headTracker.StartAsync();
+            }
         }
 
         RefreshTrayIconVisual();
@@ -1442,6 +1469,35 @@ public sealed class MainWindow : Window
         RefreshTrayIconVisual();
     }
 
+    public async Task ToggleHeadTrackerOnBarAsync()
+    {
+        _cursorSettings.ToggleHeadTrackerOnBar();
+        bool enabled = _cursorSettings.HeadTrackerEnabled;
+
+        _headTrackerButton.Content = _cursorSettings.GetHeadTrackerPillText();
+        _headTrackerButton.Foreground = enabled ? BrushGreenReady : new SolidColorBrush(Color.FromRgb(148, 163, 184));
+
+        if (enabled)
+        {
+            if (!_isListening)
+            {
+                _statusDot.Fill = BrushGreenReady;
+                _statusText.Text = "👀 INICIANDO HEAD TRACKER (WEBCAM) • Olhe para o monitor principal para calibrar...";
+            }
+            await _headTracker.StartAsync();
+        }
+        else
+        {
+            await _headTracker.StopAsync();
+            if (!_isListening)
+            {
+                _statusDot.Fill = BrushSkyBlue;
+                _statusText.Text = "👀 HEAD TRACKER DESATIVADO • Câmera desligada";
+            }
+        }
+        UpdateTrayTooltip();
+    }
+
     public void ToggleCursorLoopOnlyOnBar()
     {
         _cursorSettings.ToggleLoopOnBar();
@@ -1471,6 +1527,11 @@ public sealed class MainWindow : Window
         bool speedActive = mult > 1.001;
         _cursorEngine.SpeedMultiplier = mult;
         _cursorEngine.SmartPrecision = _cursorSettings.SmartPrecision;
+
+        _headTrackerButton.Content = _cursorSettings.GetHeadTrackerPillText();
+        _headTrackerButton.Foreground = _cursorSettings.HeadTrackerEnabled
+            ? BrushGreenReady
+            : new SolidColorBrush(Color.FromRgb(148, 163, 184));
 
         _cursorLoopButton.Content = _cursorSettings.GetLoopPillText();
         _cursorLoopButton.Foreground = _cursorSettings.Enabled
@@ -1683,6 +1744,7 @@ public sealed class MainWindow : Window
         if (CursorLoopSettings.IsCursorLoopSupported)
         {
             menu.Items.Add(new System.Windows.Forms.ToolStripSeparator());
+            menu.Items.Add("👀 Alternar Mouse p/ Centro do 2º Monitor pelo Rosto (Head ON / OFF)", null, (_, _) => Dispatcher.BeginInvoke(async () => await ToggleHeadTrackerOnBarAsync()));
             menu.Items.Add("🟢 Alternar Repetição de Borda (Loop ON / OFF)", null, (_, _) => Dispatcher.BeginInvoke(ToggleCursorLoopOnlyOnBar));
             menu.Items.Add("⚡ Alternar Velocidade do Cursor (Ciclo)", null, (_, _) => Dispatcher.BeginInvoke(CycleCursorSpeedOnlyOnBar));
             menu.Items.Add("   • Velocidade Nível 1 (1.8x) [Ctrl+Alt+1]", null, (_, _) => Dispatcher.BeginInvoke(() => SetCursorLoopLevelOnBar(1)));
@@ -1889,6 +1951,7 @@ public sealed class MainWindow : Window
         catch { }
 
         try { _cursorTimer.Stop(); _cursorTimer.Dispose(); } catch { }
+        try { _headTracker.Dispose(); } catch { }
         try { _mic.Dispose(); } catch { }
         try { _rewriter.Dispose(); } catch { }
         try { NativeInterop.UndockNativeSidebarAppBar(); } catch { }

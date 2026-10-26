@@ -24,6 +24,7 @@ public sealed class CursorLoopSettings
     public bool Enabled { get; set; } = false;
     public int SpeedLevel { get; set; } = 0; // 0 = 1.0x (OFF), 1 = 1.8x, 2 = 2.8x, 3 = 4.5x
     public bool RealtimeRewriteEnabled { get; set; } = false; // false = Modo Nativo Puro (sem correção/sem 6 opções)
+    public bool HeadTrackerEnabled { get; set; } = false; // Flag: Move mouse to center of 2nd monitor when face turns right
     public double Level1Multiplier { get; set; } = 1.8;
     public double Level2Multiplier { get; set; } = 2.8;
     public double Level3Multiplier { get; set; } = 4.5;
@@ -86,9 +87,23 @@ public sealed class CursorLoopSettings
         return RealtimeRewriteEnabled ? "✨ 6 Opções: ON" : "⚡ Só Nativo";
     }
 
+    public string GetHeadTrackerPillText()
+    {
+        return HeadTrackerEnabled ? "👀 Head ON" : "👀 Head OFF";
+    }
+
     public string GetModePillText()
     {
         return $"{GetLoopPillText()} • {GetSpeedPillText()}";
+    }
+
+    /// <summary>
+    /// Alterna o modo Head Motion Detection (move o mouse para o centro do 2º monitor ao virar o rosto para a direita).
+    /// </summary>
+    public void ToggleHeadTrackerOnBar()
+    {
+        HeadTrackerEnabled = !HeadTrackerEnabled;
+        Save();
     }
 
     /// <summary>
@@ -240,6 +255,17 @@ public sealed class CursorWrapEngine
         _lastRefresh = Environment.TickCount64;
     }
 
+    public void NotifyExternalWarp(Point newPoint)
+    {
+        _previous = newPoint;
+        _hasPrevious = true;
+        _lastDx = 0;
+        _lastDy = 0;
+        _remX = 0;
+        _remY = 0;
+        _lastWarp = Environment.TickCount64;
+    }
+
     public void Tick(bool loopEnabled, bool horizontal, bool vertical)
     {
         double multiplier = SpeedMultiplier;
@@ -278,6 +304,15 @@ public sealed class CursorWrapEngine
         }
 
         _lastMoveTick = now;
+
+        // Ignora saltos externos (ex: teletransporte do HeadMonitorTracker entre monitores) para não aplicar boost
+        if (Math.Abs(dx) > 240 || Math.Abs(dy) > 240)
+        {
+            _previous = point;
+            _remX = 0;
+            _remY = 0;
+            return;
+        }
 
         if (speedActive && now - _lastWarp >= 40)
         {
@@ -706,5 +741,502 @@ public static class AutoUpdateService
         }
     }
 }
+
+// ============================================================================
+// 3. HEAD MOTION MONITOR SWITCHER (Mouse p/ Centro do 2º Monitor via Rosto)
+// ============================================================================
+
+/// <summary>
+/// Motor nativo em tempo real (Windows.Media.FaceAnalysis + MediaFrameReader) que detecta a rotação
+/// horizontal do rosto (Yaw para a direita) e move o cursor automaticamente para o centro do segundo monitor
+/// quando o usuário vira o rosto para a direita, retornando ao centro do monitor principal quando volta a olhar reto.
+/// Opera somente na transição de estado (com histerese), nunca brigando com o mouse físico.
+/// </summary>
+[System.Runtime.Versioning.SupportedOSPlatform("windows10.0.19041.0")]
+public sealed class HeadMonitorTracker : IDisposable
+{
+    private Windows.Media.Capture.MediaCapture? _mediaCapture;
+    private Windows.Media.Capture.Frames.MediaFrameReader? _frameReader;
+    private Windows.Media.FaceAnalysis.FaceDetector? _faceDetector;
+
+    private volatile bool _isRunning;
+    private int _isProcessingFrame;
+    private long _lastFrameTick;
+
+    // Auto-calibração neutra (olhando para o monitor principal ao ativar)
+    private int _calibrationSamples;
+    private double _calibSumX;
+    private double _calibSumU;
+    private double _calibSumAsym;
+    private double _baselineX = 0.50;
+    private double _baselineU = 0.50;
+    private double _baselineAsym = 0.0;
+    private bool _isCalibrated;
+
+    // Filtro EMA + Histerese de transição entre Monitor 1 (Reto) e Monitor 2 (Rosto p/ Direita)
+    private double _smoothedYawRight;
+    private bool _isLookingRight;
+    private int _consecutiveRightFrames;
+    private int _consecutiveStraightFrames;
+    private long _lastWarpTick;
+    private byte[]? _pixelBuffer;
+
+    // Limiares com histerese (evita oscilação na fronteira entre monitores)
+    private const double EnterRightMonitorThreshold = 0.135;
+    private const double ReturnPrimaryMonitorThreshold = 0.055;
+    private const int ConfirmFramesRequired = 2;
+
+    public bool IsRunning => _isRunning;
+    public bool IsLookingRight => _isLookingRight;
+    public double CurrentYawScore => _smoothedYawRight;
+    public CursorWrapEngine? WrapEngine { get; set; }
+
+    public event Action<string, bool, double>? OnStateUpdated;
+
+    public async Task StartAsync()
+    {
+        if (_isRunning)
+            return;
+
+        _isRunning = true;
+        ResetCalibration();
+
+        try
+        {
+            if (!Windows.Media.FaceAnalysis.FaceDetector.IsSupported)
+            {
+                _isRunning = false;
+                OnStateUpdated?.Invoke("HEAD TRACKER: FaceDetector não suportado neste Windows", false, 0);
+                return;
+            }
+
+            _faceDetector = await Windows.Media.FaceAnalysis.FaceDetector.CreateAsync();
+
+            var sourceGroups = await Windows.Media.Capture.Frames.MediaFrameSourceGroup.FindAllAsync();
+            Windows.Media.Capture.Frames.MediaFrameSourceGroup? selectedGroup = null;
+            Windows.Media.Capture.Frames.MediaFrameSourceInfo? selectedSourceInfo = null;
+
+            foreach (var group in sourceGroups)
+            {
+                foreach (var si in group.SourceInfos)
+                {
+                    if (si.SourceKind == Windows.Media.Capture.Frames.MediaFrameSourceKind.Color &&
+                        (si.MediaStreamType == Windows.Media.Capture.MediaStreamType.VideoPreview ||
+                         si.MediaStreamType == Windows.Media.Capture.MediaStreamType.VideoRecord))
+                    {
+                        selectedGroup = group;
+                        selectedSourceInfo = si;
+                        break;
+                    }
+                }
+                if (selectedGroup != null)
+                    break;
+            }
+
+            if (selectedGroup == null || selectedSourceInfo == null)
+            {
+                _isRunning = false;
+                OnStateUpdated?.Invoke("HEAD TRACKER: Nenhuma webcam encontrada", false, 0);
+                return;
+            }
+
+            _mediaCapture = new Windows.Media.Capture.MediaCapture();
+            var settings = new Windows.Media.Capture.MediaCaptureInitializationSettings
+            {
+                SourceGroup = selectedGroup,
+                SharingMode = Windows.Media.Capture.MediaCaptureSharingMode.ExclusiveControl,
+                MemoryPreference = Windows.Media.Capture.MediaCaptureMemoryPreference.Cpu,
+                StreamingCaptureMode = Windows.Media.Capture.StreamingCaptureMode.Video
+            };
+
+            try
+            {
+                await _mediaCapture.InitializeAsync(settings);
+            }
+            catch
+            {
+                // Fallback para SharedReadOnly caso outro app já esteja usando a webcam
+                _mediaCapture.Dispose();
+                _mediaCapture = new Windows.Media.Capture.MediaCapture();
+                settings.SharingMode = Windows.Media.Capture.MediaCaptureSharingMode.SharedReadOnly;
+                await _mediaCapture.InitializeAsync(settings);
+            }
+
+            if (!_mediaCapture.FrameSources.TryGetValue(selectedSourceInfo.Id, out var frameSource))
+            {
+                frameSource = _mediaCapture.FrameSources.Values.FirstOrDefault(
+                    s => s.Info.SourceKind == Windows.Media.Capture.Frames.MediaFrameSourceKind.Color);
+            }
+
+            if (frameSource == null)
+            {
+                await StopAsync();
+                OnStateUpdated?.Invoke("HEAD TRACKER: Fonte de vídeo indisponível", false, 0);
+                return;
+            }
+
+            // Seleciona resolução leve (ex: 320x240 ou 640x360/480) para mínima latência (~2ms) e <1% CPU
+            try
+            {
+                var preferredFormat = frameSource.SupportedFormats
+                    .Where(f => f.VideoFormat.Width >= 320 && f.VideoFormat.Width <= 640 && f.FrameRate.Numerator >= 15)
+                    .OrderBy(f => f.VideoFormat.Width * f.VideoFormat.Height)
+                    .FirstOrDefault();
+
+                if (preferredFormat != null)
+                {
+                    await frameSource.SetFormatAsync(preferredFormat);
+                }
+            }
+            catch { }
+
+            _frameReader = await _mediaCapture.CreateFrameReaderAsync(frameSource);
+            _frameReader.AcquisitionMode = Windows.Media.Capture.Frames.MediaFrameReaderAcquisitionMode.Realtime;
+            _frameReader.FrameArrived += OnFrameArrived;
+
+            var status = await _frameReader.StartAsync();
+            if (status != Windows.Media.Capture.Frames.MediaFrameReaderStartStatus.Success)
+            {
+                await StopAsync();
+                OnStateUpdated?.Invoke($"HEAD TRACKER: Câmera ocupada ({status})", false, 0);
+                return;
+            }
+
+            OnStateUpdated?.Invoke("👀 HEAD TRACKER ATIVO • Calibrando centro (olhe p/ o monitor principal)...", false, 0);
+        }
+        catch (Exception ex)
+        {
+            await StopAsync();
+            OnStateUpdated?.Invoke($"HEAD TRACKER ERRO: {ex.Message}", false, 0);
+        }
+    }
+
+    public void ResetCalibration()
+    {
+        _calibrationSamples = 0;
+        _calibSumX = 0;
+        _calibSumU = 0;
+        _calibSumAsym = 0;
+        _isCalibrated = false;
+        _smoothedYawRight = 0;
+        _isLookingRight = false;
+        _consecutiveRightFrames = 0;
+        _consecutiveStraightFrames = 0;
+    }
+
+    public async Task StopAsync()
+    {
+        _isRunning = false;
+        try
+        {
+            if (_frameReader != null)
+            {
+                _frameReader.FrameArrived -= OnFrameArrived;
+                await _frameReader.StopAsync();
+                _frameReader.Dispose();
+                _frameReader = null;
+            }
+        }
+        catch { }
+
+        try
+        {
+            if (_mediaCapture != null)
+            {
+                _mediaCapture.Dispose();
+                _mediaCapture = null;
+            }
+        }
+        catch { }
+    }
+
+    private async void OnFrameArrived(
+        Windows.Media.Capture.Frames.MediaFrameReader sender,
+        Windows.Media.Capture.Frames.MediaFrameArrivedEventArgs args)
+    {
+        if (!_isRunning || _faceDetector == null)
+            return;
+
+        long now = Environment.TickCount64;
+        if (now - _lastFrameTick < 55) // ~18 FPS é ideal para resposta imediata com uso mínimo de CPU
+            return;
+
+        if (Interlocked.CompareExchange(ref _isProcessingFrame, 1, 0) != 0)
+            return;
+
+        _lastFrameTick = now;
+
+        try
+        {
+            Windows.Graphics.Imaging.SoftwareBitmap? grayBitmap = null;
+            using (var frameRef = sender.TryAcquireLatestFrame())
+            {
+                var sourceBitmap = frameRef?.VideoMediaFrame?.SoftwareBitmap;
+                if (sourceBitmap == null)
+                    return;
+
+                grayBitmap = sourceBitmap.BitmapPixelFormat == Windows.Graphics.Imaging.BitmapPixelFormat.Gray8
+                    ? Windows.Graphics.Imaging.SoftwareBitmap.Copy(sourceBitmap)
+                    : Windows.Graphics.Imaging.SoftwareBitmap.Convert(sourceBitmap, Windows.Graphics.Imaging.BitmapPixelFormat.Gray8);
+            }
+
+            using (grayBitmap)
+            {
+                var faces = await _faceDetector.DetectFacesAsync(grayBitmap);
+                if (faces == null || faces.Count == 0)
+                    return;
+
+                // Seleciona o rosto principal (maior área na câmera)
+                Windows.Media.FaceAnalysis.DetectedFace? mainFace = null;
+                uint maxArea = 0;
+                foreach (var f in faces)
+                {
+                    uint area = f.FaceBox.Width * f.FaceBox.Height;
+                    if (area > maxArea)
+                    {
+                        maxArea = area;
+                        mainFace = f;
+                    }
+                }
+
+                if (mainFace == null || mainFace.FaceBox.Width < 24 || mainFace.FaceBox.Height < 24)
+                    return;
+
+                int frameW = grayBitmap.PixelWidth;
+                int frameH = grayBitmap.PixelHeight;
+                int byteCount = frameW * frameH;
+                if (_pixelBuffer == null || _pixelBuffer.Length != byteCount)
+                {
+                    _pixelBuffer = new byte[byteCount];
+                }
+
+                var winrtBuffer = new Windows.Storage.Streams.Buffer((uint)byteCount);
+                grayBitmap.CopyToBuffer(winrtBuffer);
+                using (var reader = Windows.Storage.Streams.DataReader.FromBuffer(winrtBuffer))
+                {
+                    reader.ReadBytes(_pixelBuffer);
+                }
+
+                var box = mainFace.FaceBox;
+                double faceCenterNormX = (box.X + 0.5 * box.Width) / frameW;
+                double faceWidthNorm = Math.Max(0.12, (double)box.Width / frameW);
+
+                var (featureCentroidU, cheekGradAsym) = ComputeInternalFaceYawFeatures(
+                    _pixelBuffer,
+                    frameW,
+                    frameH,
+                    (int)box.X,
+                    (int)box.Y,
+                    (int)box.Width,
+                    (int)box.Height);
+
+                if (!_isCalibrated)
+                {
+                    _calibSumX += faceCenterNormX;
+                    _calibSumU += featureCentroidU;
+                    _calibSumAsym += cheekGradAsym;
+                    _calibrationSamples++;
+
+                    if (_calibrationSamples >= 6)
+                    {
+                        _baselineX = _calibSumX / _calibrationSamples;
+                        _baselineU = _calibSumU / _calibrationSamples;
+                        _baselineAsym = _calibSumAsym / _calibrationSamples;
+                        _isCalibrated = true;
+                        OnStateUpdated?.Invoke("👀 HEAD TRACKER CALIBRADO • Olhe p/ direita para centralizar no 2º monitor", false, 0);
+                    }
+                    return;
+                }
+
+                // No sensor nativo (não espelhado) da webcam frontal:
+                // Virar o rosto para a DIREITA física do usuário desloca a face e a ponta do nariz para a ESQUERDA da imagem bruta (X e U menores).
+                double posShiftRight = (_baselineX - faceCenterNormX) / faceWidthNorm;
+                double featShiftRight = _baselineU - featureCentroidU;
+                double asymShiftRight = cheekGradAsym - _baselineAsym;
+
+                double rawYawRight = (0.68 * posShiftRight) + (3.60 * featShiftRight) + (0.40 * asymShiftRight);
+                _smoothedYawRight = (0.48 * rawYawRight) + (0.52 * _smoothedYawRight);
+
+                // Adaptação lenta de postura neutra quando o usuário está olhando reto para o monitor principal
+                if (!_isLookingRight && Math.Abs(rawYawRight) < 0.055)
+                {
+                    _baselineX = (0.985 * _baselineX) + (0.015 * faceCenterNormX);
+                    _baselineU = (0.985 * _baselineU) + (0.015 * featureCentroidU);
+                    _baselineAsym = (0.985 * _baselineAsym) + (0.015 * cheekGradAsym);
+                }
+
+                if (!_isLookingRight)
+                {
+                    if (_smoothedYawRight >= EnterRightMonitorThreshold)
+                    {
+                        _consecutiveRightFrames++;
+                        if (_consecutiveRightFrames >= ConfirmFramesRequired)
+                        {
+                            _isLookingRight = true;
+                            _consecutiveRightFrames = 0;
+                            _consecutiveStraightFrames = 0;
+                            WarpCursorToMonitorCenter(secondaryMonitor: true);
+                            OnStateUpdated?.Invoke($"👀 ROSTO P/ DIREITA ({_smoothedYawRight:0.00}) ➔ Mouse no centro do 2º Monitor", true, _smoothedYawRight);
+                        }
+                    }
+                    else
+                    {
+                        _consecutiveRightFrames = 0;
+                    }
+                }
+                else
+                {
+                    if (_smoothedYawRight <= ReturnPrimaryMonitorThreshold)
+                    {
+                        _consecutiveStraightFrames++;
+                        if (_consecutiveStraightFrames >= ConfirmFramesRequired)
+                        {
+                            _isLookingRight = false;
+                            _consecutiveStraightFrames = 0;
+                            _consecutiveRightFrames = 0;
+                            WarpCursorToMonitorCenter(secondaryMonitor: false);
+                            OnStateUpdated?.Invoke($"👀 ROSTO RETO ({_smoothedYawRight:0.00}) ➔ Mouse no centro do 1º Monitor", false, _smoothedYawRight);
+                        }
+                    }
+                    else
+                    {
+                        _consecutiveStraightFrames = 0;
+                    }
+                }
+            }
+        }
+        catch
+        {
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _isProcessingFrame, 0);
+        }
+    }
+
+    /// <summary>
+    /// Calcula o centroide horizontal das feições internas (olhos, nariz e boca) e a assimetria de gradiente
+    /// entre as metades da face para estimar o ângulo de Yaw (rotação horizontal da cabeça).
+    /// </summary>
+    private static (double FeatureCentroidU, double CheekGradAsym) ComputeInternalFaceYawFeatures(
+        byte[] grayPixels,
+        int frameW,
+        int frameH,
+        int boxX,
+        int boxY,
+        int boxW,
+        int boxH)
+    {
+        int x0 = Math.Clamp(boxX + (int)(boxW * 0.10), 1, frameW - 2);
+        int x1 = Math.Clamp(boxX + (int)(boxW * 0.90), 1, frameW - 2);
+        int y0 = Math.Clamp(boxY + (int)(boxH * 0.22), 1, frameH - 2);
+        int y1 = Math.Clamp(boxY + (int)(boxH * 0.78), 1, frameH - 2);
+
+        if (x1 <= x0 + 4 || y1 <= y0 + 4)
+            return (0.50, 0.0);
+
+        long lumSum = 0;
+        int count = 0;
+        for (int y = y0; y <= y1; y += 2)
+        {
+            int rowOffset = y * frameW;
+            for (int x = x0; x <= x1; x += 2)
+            {
+                lumSum += grayPixels[rowOffset + x];
+                count++;
+            }
+        }
+
+        double meanLum = count > 0 ? (double)lumSum / count : 128.0;
+        double weightedUSum = 0.0;
+        double weightSum = 0.0;
+        double leftHalfGrad = 0.0;
+        double rightHalfGrad = 0.0;
+        int midX = boxX + (boxW / 2);
+
+        for (int y = y0; y <= y1; y += 2)
+        {
+            int rowOffset = y * frameW;
+            int prevRow = (y - 1) * frameW;
+            int nextRow = (y + 1) * frameW;
+
+            for (int x = x0; x <= x1; x += 2)
+            {
+                int idx = rowOffset + x;
+                int gx = Math.Abs(grayPixels[idx + 1] - grayPixels[idx - 1]);
+                int gy = Math.Abs(grayPixels[nextRow + x] - grayPixels[prevRow + x]);
+                double grad = gx + 0.5 * gy;
+                double darkSalience = Math.Max(0.0, meanLum - grayPixels[idx]);
+
+                double weight = grad + 0.85 * darkSalience;
+                double u = (double)(x - boxX) / boxW;
+
+                weightedUSum += u * weight;
+                weightSum += weight;
+
+                if (x < midX)
+                    leftHalfGrad += grad;
+                else
+                    rightHalfGrad += grad;
+            }
+        }
+
+        double centroidU = weightSum > 1e-3 ? (weightedUSum / weightSum) : 0.50;
+        double asym = (leftHalfGrad - rightHalfGrad) / (leftHalfGrad + rightHalfGrad + 1.0);
+        return (centroidU, asym);
+    }
+
+    private void WarpCursorToMonitorCenter(bool secondaryMonitor)
+    {
+        try
+        {
+            // Nunca interrompe um clique/arraste ativo do mouse
+            if (Control.MouseButtons != MouseButtons.None)
+                return;
+
+            long now = Environment.TickCount64;
+            if (now - _lastWarpTick < 180)
+                return;
+
+            Screen[] screens = Screen.AllScreens;
+            if (screens.Length < 2)
+                return;
+
+            Screen? targetScreen;
+            if (secondaryMonitor)
+            {
+                // Seleciona o segundo monitor (!Primary)
+                targetScreen = screens.FirstOrDefault(s => !s.Primary) ?? screens[^1];
+            }
+            else
+            {
+                // Seleciona o monitor principal (Primary)
+                targetScreen = Screen.PrimaryScreen ?? screens.FirstOrDefault(s => s.Primary) ?? screens[0];
+            }
+
+            Rectangle b = targetScreen.Bounds;
+            Point center = new(b.Left + (b.Width / 2), b.Top + (b.Height / 2));
+
+            // Na transição para o 2º monitor (rosto p/ direita), sempre centraliza no 2º monitor.
+            // Na volta para o 1º monitor (rosto reto), centraliza no 1º monitor se o cursor estava no 2º monitor.
+            Screen currentScreen = Screen.FromPoint(Cursor.Position);
+            if (secondaryMonitor || !string.Equals(currentScreen.DeviceName, targetScreen.DeviceName, StringComparison.OrdinalIgnoreCase))
+            {
+                Cursor.Position = center;
+                WrapEngine?.NotifyExternalWarp(center);
+                _lastWarpTick = now;
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    public void Dispose()
+    {
+        _ = StopAsync();
+    }
+}
+
 
 

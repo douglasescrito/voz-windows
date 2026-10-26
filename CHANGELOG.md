@@ -4,6 +4,13 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.6] — 26/10/2026
+
+- **Novo Modo Head Motion Monitor (👀 Head ON / OFF):** Move o mouse em tempo real para o centro do segundo monitor ao virar o rosto para a direita, retornando ao centro do monitor principal quando o rosto volta a ficar reto (com auto-calibração, filtro EMA e histerese para não brigar com o mouse físico).
+- **Flag na Barra de Controle e no Menu da Bandeja:** Botão rápido 👀 Head OFF / ON na barra inferior e item correspondente no menu do ícone da bandeja do sistema.
+
+---
+
 ## [v1.3.5] — 25/10/2026
 
 - 🟢 **Teletransporte de borda (Loop ON) ativo por padrão ao abrir:** sempre inicia com a repetição de borda (Loop ON) habilitada automaticamente ao abrir o aplicativo.
