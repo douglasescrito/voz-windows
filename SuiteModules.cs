@@ -25,6 +25,15 @@ public sealed class CursorLoopSettings
     public int SpeedLevel { get; set; } = 0; // 0 = 1.0x (OFF), 1 = 1.8x, 2 = 2.8x, 3 = 4.5x
     public bool RealtimeRewriteEnabled { get; set; } = false; // false = Modo Nativo Puro (sem correção/sem 6 opções)
     public bool HeadTrackerEnabled { get; set; } = false; // Flag: Move mouse to center of 2nd monitor when face turns right
+    public double HeadSensitivity { get; set; } = 2.4; // Multiplicador de sensibilidade do giro (0.5x a 4.5x)
+    public double HeadDistanceBoost { get; set; } = 2.0; // Compensação automática para trabalhar mais distante (1.0x a 3.5x)
+    public double HeadEnterThreshold { get; set; } = 0.080; // Limiar de disparo p/ 2º monitor (menor = mais sensível)
+    public double HeadReturnThreshold { get; set; } = 0.032; // Limiar de volta p/ 1º monitor
+    public double HeadSmoothingAlpha { get; set; } = 0.65; // Velocidade de resposta do filtro EMA (0.20 a 0.95)
+    public int HeadConfirmFrames { get; set; } = 1; // 1 frame = resposta imediata (~50ms)
+    public bool HeadReturnToPrimary { get; set; } = true; // Volta o mouse p/ o centro do 1º monitor ao olhar reto
+    public bool HeadLongDistanceHdMode { get; set; } = true; // Captura HD + rastreio de rosto pequeno/distante
+    public int HeadConfigVersion { get; set; } = 2;
     public double Level1Multiplier { get; set; } = 1.8;
     public double Level2Multiplier { get; set; } = 2.8;
     public double Level3Multiplier { get; set; } = 4.5;
@@ -188,6 +197,18 @@ public sealed class CursorLoopSettings
             loaded.Enabled = true;
             loaded.HorizontalLoop = true;
             loaded.VerticalLoop = true;
+            if (loaded.HeadConfigVersion < 2)
+            {
+                loaded.HeadSensitivity = 2.4;
+                loaded.HeadDistanceBoost = 2.0;
+                loaded.HeadEnterThreshold = 0.080;
+                loaded.HeadReturnThreshold = 0.032;
+                loaded.HeadSmoothingAlpha = 0.65;
+                loaded.HeadConfirmFrames = 1;
+                loaded.HeadReturnToPrimary = true;
+                loaded.HeadLongDistanceHdMode = true;
+                loaded.HeadConfigVersion = 2;
+            }
             loaded.Save();
             return loaded;
         }
@@ -196,6 +217,15 @@ public sealed class CursorLoopSettings
             Enabled = true,
             SpeedLevel = 1,
             RealtimeRewriteEnabled = false,
+            HeadSensitivity = 2.4,
+            HeadDistanceBoost = 2.0,
+            HeadEnterThreshold = 0.080,
+            HeadReturnThreshold = 0.032,
+            HeadSmoothingAlpha = 0.65,
+            HeadConfirmFrames = 1,
+            HeadReturnToPrimary = true,
+            HeadLongDistanceHdMode = true,
+            HeadConfigVersion = 2,
             HorizontalLoop = true,
             VerticalLoop = true
         };
@@ -743,14 +773,35 @@ public static class AutoUpdateService
 }
 
 // ============================================================================
-// 3. HEAD MOTION MONITOR SWITCHER (Mouse p/ Centro do 2º Monitor via Rosto)
+// 3. HEAD MOTION MONITOR SWITCHER + TELA DE TESTE E CONFIGURAÇÃO EM TEMPO REAL
 // ============================================================================
 
+public sealed record HeadTrackerTelemetry(
+    byte[]? GrayPixels,
+    int FrameWidth,
+    int FrameHeight,
+    Rectangle FaceBox,
+    double FaceCenterNormX,
+    double BaselineX,
+    double FeatureCentroidU,
+    double BaselineU,
+    double RawYawRight,
+    double SmoothedYawRight,
+    double EnterThreshold,
+    double ReturnThreshold,
+    double DistanceGainApplied,
+    double TotalGainApplied,
+    bool IsCalibrated,
+    bool IsLookingRight,
+    bool FaceDetected,
+    bool IsFallbackLongRangeRoi,
+    string StatusMessage);
+
 /// <summary>
-/// Motor nativo em tempo real (Windows.Media.FaceAnalysis + MediaFrameReader) que detecta a rotação
-/// horizontal do rosto (Yaw para a direita) e move o cursor automaticamente para o centro do segundo monitor
-/// quando o usuário vira o rosto para a direita, retornando ao centro do monitor principal quando volta a olhar reto.
-/// Opera somente na transição de estado (com histerese), nunca brigando com o mouse físico.
+/// Motor nativo em tempo real (Windows.Media.FaceAnalysis + MediaFrameReader + ROI Long-Range Tracker)
+/// que detecta a rotação horizontal do rosto (Yaw para a direita) com alta sensibilidade e compensação
+/// automática de distância, movendo o cursor para o centro do segundo monitor ao virar à direita e
+/// retornando ao centro do monitor principal quando volta a olhar reto.
 /// </summary>
 [System.Runtime.Versioning.SupportedOSPlatform("windows10.0.19041.0")]
 public sealed class HeadMonitorTracker : IDisposable
@@ -773,6 +824,10 @@ public sealed class HeadMonitorTracker : IDisposable
     private double _baselineAsym = 0.0;
     private bool _isCalibrated;
 
+    // Última posição conhecida da face para rastreio contínuo mesmo longe ou em perfil (>40°)
+    private Rectangle _lastValidFaceBox;
+    private long _lastValidFaceTick;
+
     // Filtro EMA + Histerese de transição entre Monitor 1 (Reto) e Monitor 2 (Rosto p/ Direita)
     private double _smoothedYawRight;
     private bool _isLookingRight;
@@ -781,17 +836,16 @@ public sealed class HeadMonitorTracker : IDisposable
     private long _lastWarpTick;
     private byte[]? _pixelBuffer;
 
-    // Limiares com histerese (evita oscilação na fronteira entre monitores)
-    private const double EnterRightMonitorThreshold = 0.135;
-    private const double ReturnPrimaryMonitorThreshold = 0.055;
-    private const int ConfirmFramesRequired = 2;
-
     public bool IsRunning => _isRunning;
     public bool IsLookingRight => _isLookingRight;
     public double CurrentYawScore => _smoothedYawRight;
     public CursorWrapEngine? WrapEngine { get; set; }
+    public CursorLoopSettings? Settings { get; set; }
+    public volatile bool IncludePreviewFrame;
+    public volatile bool PauseMouseWarpForTest;
 
     public event Action<string, bool, double>? OnStateUpdated;
+    public event Action<HeadTrackerTelemetry>? OnTelemetryFrame;
 
     public async Task StartAsync()
     {
@@ -811,6 +865,12 @@ public sealed class HeadMonitorTracker : IDisposable
             }
 
             _faceDetector = await Windows.Media.FaceAnalysis.FaceDetector.CreateAsync();
+            // Reduz o tamanho mínimo detectável do rosto para permitir trabalhar mais distante da webcam
+            try
+            {
+                _faceDetector.MinDetectableFaceSize = new Windows.Graphics.Imaging.BitmapSize { Width = 16, Height = 16 };
+            }
+            catch { }
 
             var sourceGroups = await Windows.Media.Capture.Frames.MediaFrameSourceGroup.FindAllAsync();
             Windows.Media.Capture.Frames.MediaFrameSourceGroup? selectedGroup = null;
@@ -855,7 +915,6 @@ public sealed class HeadMonitorTracker : IDisposable
             }
             catch
             {
-                // Fallback para SharedReadOnly caso outro app já esteja usando a webcam
                 _mediaCapture.Dispose();
                 _mediaCapture = new Windows.Media.Capture.MediaCapture();
                 settings.SharingMode = Windows.Media.Capture.MediaCaptureSharingMode.SharedReadOnly;
@@ -875,12 +934,17 @@ public sealed class HeadMonitorTracker : IDisposable
                 return;
             }
 
-            // Seleciona resolução leve (ex: 320x240 ou 640x360/480) para mínima latência (~2ms) e <1% CPU
+            // No Modo Longa Distância HD, seleciona 640x480 / 960x540 / 1280x720 para enxergar o rosto mesmo afastado na cadeira
             try
             {
+                bool hdMode = Settings?.HeadLongDistanceHdMode ?? true;
+                int targetWidth = hdMode ? 640 : 320;
+                int maxWidth = hdMode ? 1280 : 640;
+
                 var preferredFormat = frameSource.SupportedFormats
-                    .Where(f => f.VideoFormat.Width >= 320 && f.VideoFormat.Width <= 640 && f.FrameRate.Numerator >= 15)
-                    .OrderBy(f => f.VideoFormat.Width * f.VideoFormat.Height)
+                    .Where(f => f.VideoFormat.Width >= 320 && f.VideoFormat.Width <= maxWidth && f.FrameRate.Numerator >= 15)
+                    .OrderBy(f => Math.Abs((int)f.VideoFormat.Width - targetWidth))
+                    .ThenByDescending(f => (double)f.FrameRate.Numerator / Math.Max(1u, f.FrameRate.Denominator))
                     .FirstOrDefault();
 
                 if (preferredFormat != null)
@@ -922,6 +986,7 @@ public sealed class HeadMonitorTracker : IDisposable
         _isLookingRight = false;
         _consecutiveRightFrames = 0;
         _consecutiveStraightFrames = 0;
+        _lastValidFaceTick = 0;
     }
 
     public async Task StopAsync()
@@ -958,7 +1023,7 @@ public sealed class HeadMonitorTracker : IDisposable
             return;
 
         long now = Environment.TickCount64;
-        if (now - _lastFrameTick < 55) // ~18 FPS é ideal para resposta imediata com uso mínimo de CPU
+        if (now - _lastFrameTick < 48) // ~20 FPS para resposta ultra ágil
             return;
 
         if (Interlocked.CompareExchange(ref _isProcessingFrame, 1, 0) != 0)
@@ -982,26 +1047,6 @@ public sealed class HeadMonitorTracker : IDisposable
 
             using (grayBitmap)
             {
-                var faces = await _faceDetector.DetectFacesAsync(grayBitmap);
-                if (faces == null || faces.Count == 0)
-                    return;
-
-                // Seleciona o rosto principal (maior área na câmera)
-                Windows.Media.FaceAnalysis.DetectedFace? mainFace = null;
-                uint maxArea = 0;
-                foreach (var f in faces)
-                {
-                    uint area = f.FaceBox.Width * f.FaceBox.Height;
-                    if (area > maxArea)
-                    {
-                        maxArea = area;
-                        mainFace = f;
-                    }
-                }
-
-                if (mainFace == null || mainFace.FaceBox.Width < 24 || mainFace.FaceBox.Height < 24)
-                    return;
-
                 int frameW = grayBitmap.PixelWidth;
                 int frameH = grayBitmap.PixelHeight;
                 int byteCount = frameW * frameH;
@@ -1017,91 +1062,245 @@ public sealed class HeadMonitorTracker : IDisposable
                     reader.ReadBytes(_pixelBuffer);
                 }
 
-                var box = mainFace.FaceBox;
-                double faceCenterNormX = (box.X + 0.5 * box.Width) / frameW;
-                double faceWidthNorm = Math.Max(0.12, (double)box.Width / frameW);
+                var faces = await _faceDetector.DetectFacesAsync(grayBitmap);
+
+                Windows.Media.FaceAnalysis.DetectedFace? mainFace = null;
+                uint maxArea = 0;
+                if (faces != null)
+                {
+                    foreach (var f in faces)
+                    {
+                        uint area = f.FaceBox.Width * f.FaceBox.Height;
+                        if (area > maxArea)
+                        {
+                            maxArea = area;
+                            mainFace = f;
+                        }
+                    }
+                }
+
+                Rectangle activeBox;
+                bool usedFallbackRoi = false;
+
+                if (mainFace != null && mainFace.FaceBox.Width >= 12 && mainFace.FaceBox.Height >= 12)
+                {
+                    activeBox = new Rectangle(
+                        (int)mainFace.FaceBox.X,
+                        (int)mainFace.FaceBox.Y,
+                        (int)mainFace.FaceBox.Width,
+                        (int)mainFace.FaceBox.Height);
+                    _lastValidFaceBox = activeBox;
+                    _lastValidFaceTick = now;
+                }
+                else if (now - _lastValidFaceTick <= 2600 && _lastValidFaceBox.Width >= 12)
+                {
+                    // Rastreio contínuo de longa distância / perfil lateral quando o usuário vira muito o rosto ou se afasta
+                    activeBox = TrackFaceRoiFallback(_pixelBuffer, frameW, frameH, _lastValidFaceBox);
+                    _lastValidFaceBox = activeBox;
+                    usedFallbackRoi = true;
+                }
+                else
+                {
+                    if (IncludePreviewFrame)
+                    {
+                        byte[]? previewCopy = new byte[byteCount];
+                        Buffer.BlockCopy(_pixelBuffer, 0, previewCopy, 0, byteCount);
+                        OnTelemetryFrame?.Invoke(new HeadTrackerTelemetry(
+                            previewCopy,
+                            frameW,
+                            frameH,
+                            Rectangle.Empty,
+                            0.5,
+                            _baselineX,
+                            0.5,
+                            _baselineU,
+                            0,
+                            _smoothedYawRight,
+                            Settings?.HeadEnterThreshold ?? 0.080,
+                            Settings?.HeadReturnThreshold ?? 0.032,
+                            1.0,
+                            Settings?.HeadSensitivity ?? 2.4,
+                            _isCalibrated,
+                            _isLookingRight,
+                            false,
+                            false,
+                            "Aguardando rosto na câmera (aproxime-se ou olhe para a câmera)..."));
+                    }
+                    return;
+                }
+
+                double faceCenterNormX = (activeBox.X + 0.5 * activeBox.Width) / frameW;
+                double faceWidthNorm = Math.Max(0.06, (double)activeBox.Width / frameW);
 
                 var (featureCentroidU, cheekGradAsym) = ComputeInternalFaceYawFeatures(
                     _pixelBuffer,
                     frameW,
                     frameH,
-                    (int)box.X,
-                    (int)box.Y,
-                    (int)box.Width,
-                    (int)box.Height);
+                    activeBox.X,
+                    activeBox.Y,
+                    activeBox.Width,
+                    activeBox.Height);
+
+                double userSensitivity = Math.Clamp(Settings?.HeadSensitivity ?? 2.4, 0.4, 5.0);
+                double userDistBoost = Math.Clamp(Settings?.HeadDistanceBoost ?? 2.0, 0.8, 4.0);
+                double enterThreshold = Math.Clamp(Settings?.HeadEnterThreshold ?? 0.080, 0.020, 0.350);
+                double returnThreshold = Math.Clamp(Settings?.HeadReturnThreshold ?? 0.032, 0.005, enterThreshold - 0.010);
+                double alpha = Math.Clamp(Settings?.HeadSmoothingAlpha ?? 0.65, 0.20, 0.95);
+                int confirmFrames = Math.Clamp(Settings?.HeadConfirmFrames ?? 1, 1, 5);
+                bool returnToPrimary = Settings?.HeadReturnToPrimary ?? true;
+
+                // Ganho automático de longa distância: quanto menor o rosto na imagem (mais longe da câmera), maior a amplificação!
+                double distanceRatio = Math.Clamp(0.24 / faceWidthNorm, 1.0, 3.2);
+                double distanceGain = 1.0 + (distanceRatio - 1.0) * (userDistBoost * 0.65);
+                double totalGain = userSensitivity * distanceGain;
 
                 if (!_isCalibrated)
                 {
-                    _calibSumX += faceCenterNormX;
-                    _calibSumU += featureCentroidU;
-                    _calibSumAsym += cheekGradAsym;
-                    _calibrationSamples++;
+                    if (!usedFallbackRoi)
+                    {
+                        _calibSumX += faceCenterNormX;
+                        _calibSumU += featureCentroidU;
+                        _calibSumAsym += cheekGradAsym;
+                        _calibrationSamples++;
+                    }
 
-                    if (_calibrationSamples >= 6)
+                    if (_calibrationSamples >= 5)
                     {
                         _baselineX = _calibSumX / _calibrationSamples;
                         _baselineU = _calibSumU / _calibrationSamples;
                         _baselineAsym = _calibSumAsym / _calibrationSamples;
                         _isCalibrated = true;
-                        OnStateUpdated?.Invoke("👀 HEAD TRACKER CALIBRADO • Olhe p/ direita para centralizar no 2º monitor", false, 0);
+                        OnStateUpdated?.Invoke("👀 HEAD TRACKER CALIBRADO • Vire o rosto à direita p/ ir ao 2º monitor", false, 0);
+                    }
+
+                    if (IncludePreviewFrame)
+                    {
+                        byte[]? previewCopy = new byte[byteCount];
+                        Buffer.BlockCopy(_pixelBuffer, 0, previewCopy, 0, byteCount);
+                        OnTelemetryFrame?.Invoke(new HeadTrackerTelemetry(
+                            previewCopy,
+                            frameW,
+                            frameH,
+                            activeBox,
+                            faceCenterNormX,
+                            _baselineX,
+                            featureCentroidU,
+                            _baselineU,
+                            0,
+                            0,
+                            enterThreshold,
+                            returnThreshold,
+                            distanceGain,
+                            totalGain,
+                            false,
+                            false,
+                            true,
+                            usedFallbackRoi,
+                            $"Calibrando centro ({_calibrationSamples}/5)... Mantenha o rosto voltado ao 1º monitor."));
                     }
                     return;
                 }
 
                 // No sensor nativo (não espelhado) da webcam frontal:
                 // Virar o rosto para a DIREITA física do usuário desloca a face e a ponta do nariz para a ESQUERDA da imagem bruta (X e U menores).
-                double posShiftRight = (_baselineX - faceCenterNormX) / faceWidthNorm;
+                double posShiftRight = (_baselineX - faceCenterNormX) / Math.Max(0.10, faceWidthNorm);
                 double featShiftRight = _baselineU - featureCentroidU;
                 double asymShiftRight = cheekGradAsym - _baselineAsym;
 
-                double rawYawRight = (0.68 * posShiftRight) + (3.60 * featShiftRight) + (0.40 * asymShiftRight);
-                _smoothedYawRight = (0.48 * rawYawRight) + (0.52 * _smoothedYawRight);
+                double baseYawSignal = (0.72 * posShiftRight) + (3.85 * featShiftRight) + (0.45 * asymShiftRight);
+                double rawYawRight = baseYawSignal * (totalGain * 0.55);
+                _smoothedYawRight = (alpha * rawYawRight) + ((1.0 - alpha) * _smoothedYawRight);
 
                 // Adaptação lenta de postura neutra quando o usuário está olhando reto para o monitor principal
-                if (!_isLookingRight && Math.Abs(rawYawRight) < 0.055)
+                if (!_isLookingRight && !usedFallbackRoi && Math.Abs(rawYawRight) < returnThreshold * 0.75)
                 {
-                    _baselineX = (0.985 * _baselineX) + (0.015 * faceCenterNormX);
-                    _baselineU = (0.985 * _baselineU) + (0.015 * featureCentroidU);
-                    _baselineAsym = (0.985 * _baselineAsym) + (0.015 * cheekGradAsym);
+                    _baselineX = (0.988 * _baselineX) + (0.012 * faceCenterNormX);
+                    _baselineU = (0.988 * _baselineU) + (0.012 * featureCentroidU);
+                    _baselineAsym = (0.988 * _baselineAsym) + (0.012 * cheekGradAsym);
                 }
 
+                string statusMsg;
                 if (!_isLookingRight)
                 {
-                    if (_smoothedYawRight >= EnterRightMonitorThreshold)
+                    if (_smoothedYawRight >= enterThreshold)
                     {
                         _consecutiveRightFrames++;
-                        if (_consecutiveRightFrames >= ConfirmFramesRequired)
+                        if (_consecutiveRightFrames >= confirmFrames)
                         {
                             _isLookingRight = true;
                             _consecutiveRightFrames = 0;
                             _consecutiveStraightFrames = 0;
-                            WarpCursorToMonitorCenter(secondaryMonitor: true);
-                            OnStateUpdated?.Invoke($"👀 ROSTO P/ DIREITA ({_smoothedYawRight:0.00}) ➔ Mouse no centro do 2º Monitor", true, _smoothedYawRight);
+                            if (!PauseMouseWarpForTest)
+                            {
+                                WarpCursorToMonitorCenter(secondaryMonitor: true);
+                            }
+                            statusMsg = $"👀 ROSTO P/ DIREITA ({_smoothedYawRight:0.000}) ➔ Mouse no Centro do 2º Monitor";
+                            OnStateUpdated?.Invoke(statusMsg, true, _smoothedYawRight);
+                        }
+                        else
+                        {
+                            statusMsg = $"👀 Detectando giro p/ direita ({_smoothedYawRight:0.000})...";
                         }
                     }
                     else
                     {
                         _consecutiveRightFrames = 0;
+                        statusMsg = $"🟢 OLHANDO RETO (1º Monitor) • Sinal: {_smoothedYawRight:0.000} / Limiar: {enterThreshold:0.000}";
                     }
                 }
                 else
                 {
-                    if (_smoothedYawRight <= ReturnPrimaryMonitorThreshold)
+                    if (_smoothedYawRight <= returnThreshold)
                     {
                         _consecutiveStraightFrames++;
-                        if (_consecutiveStraightFrames >= ConfirmFramesRequired)
+                        if (_consecutiveStraightFrames >= confirmFrames)
                         {
                             _isLookingRight = false;
                             _consecutiveStraightFrames = 0;
                             _consecutiveRightFrames = 0;
-                            WarpCursorToMonitorCenter(secondaryMonitor: false);
-                            OnStateUpdated?.Invoke($"👀 ROSTO RETO ({_smoothedYawRight:0.00}) ➔ Mouse no centro do 1º Monitor", false, _smoothedYawRight);
+                            if (!PauseMouseWarpForTest && returnToPrimary)
+                            {
+                                WarpCursorToMonitorCenter(secondaryMonitor: false);
+                            }
+                            statusMsg = $"👀 ROSTO RETO ({_smoothedYawRight:0.000}) ➔ Mouse no Centro do 1º Monitor";
+                            OnStateUpdated?.Invoke(statusMsg, false, _smoothedYawRight);
+                        }
+                        else
+                        {
+                            statusMsg = $"👀 Retornando ao 1º Monitor ({_smoothedYawRight:0.000})...";
                         }
                     }
                     else
                     {
                         _consecutiveStraightFrames = 0;
+                        statusMsg = $"🎯 ATIVO NO 2º MONITOR (Rosto à Direita) • Sinal: {_smoothedYawRight:0.000}";
                     }
+                }
+
+                if (IncludePreviewFrame)
+                {
+                    byte[]? previewCopy = new byte[byteCount];
+                    Buffer.BlockCopy(_pixelBuffer, 0, previewCopy, 0, byteCount);
+                    OnTelemetryFrame?.Invoke(new HeadTrackerTelemetry(
+                        previewCopy,
+                        frameW,
+                        frameH,
+                        activeBox,
+                        faceCenterNormX,
+                        _baselineX,
+                        featureCentroidU,
+                        _baselineU,
+                        rawYawRight,
+                        _smoothedYawRight,
+                        enterThreshold,
+                        returnThreshold,
+                        distanceGain,
+                        totalGain,
+                        _isCalibrated,
+                        _isLookingRight,
+                        true,
+                        usedFallbackRoi,
+                        statusMsg));
                 }
             }
         }
@@ -1115,8 +1314,57 @@ public sealed class HeadMonitorTracker : IDisposable
     }
 
     /// <summary>
+    /// Rastreia o deslocamento horizontal da cabeça em uma janela expandida quando o usuário está muito distante
+    /// ou gira o rosto em perfil acentuado (>40°), garantindo que o giro nunca perca o disparo.
+    /// </summary>
+    private static Rectangle TrackFaceRoiFallback(byte[] grayPixels, int frameW, int frameH, Rectangle lastBox)
+    {
+        int expandX = Math.Max(18, (int)(lastBox.Width * 0.45));
+        int expandY = Math.Max(10, (int)(lastBox.Height * 0.20));
+
+        int sx0 = Math.Clamp(lastBox.X - expandX, 2, frameW - 3);
+        int sx1 = Math.Clamp(lastBox.Right + expandX, 2, frameW - 3);
+        int sy0 = Math.Clamp(lastBox.Y - expandY, 2, frameH - 3);
+        int sy1 = Math.Clamp(lastBox.Bottom + expandY, 2, frameH - 3);
+
+        double weightedX = 0;
+        double weightedY = 0;
+        double totalWeight = 0;
+
+        for (int y = sy0; y <= sy1; y += 2)
+        {
+            int row = y * frameW;
+            int prevRow = (y - 1) * frameW;
+            int nextRow = (y + 1) * frameW;
+            for (int x = sx0; x <= sx1; x += 2)
+            {
+                int idx = row + x;
+                int gx = Math.Abs(grayPixels[idx + 1] - grayPixels[idx - 1]);
+                int gy = Math.Abs(grayPixels[nextRow + x] - grayPixels[prevRow + x]);
+                double w = gx + gy;
+                if (w > 14)
+                {
+                    weightedX += x * w;
+                    weightedY += y * w;
+                    totalWeight += w;
+                }
+            }
+        }
+
+        if (totalWeight <= 10)
+            return lastBox;
+
+        int newCenterX = (int)Math.Round(weightedX / totalWeight);
+        int newCenterY = (int)Math.Round(weightedY / totalWeight);
+
+        int newX = Math.Clamp(newCenterX - (lastBox.Width / 2), 0, Math.Max(0, frameW - lastBox.Width));
+        int newY = Math.Clamp(newCenterY - (lastBox.Height / 2), 0, Math.Max(0, frameH - lastBox.Height));
+        return new Rectangle(newX, newY, lastBox.Width, lastBox.Height);
+    }
+
+    /// <summary>
     /// Calcula o centroide horizontal das feições internas (olhos, nariz e boca) e a assimetria de gradiente
-    /// entre as metades da face para estimar o ângulo de Yaw (rotação horizontal da cabeça).
+    /// entre as metades da face. Usa passo de 1px automaticamente quando o rosto está distante (boxW < 110).
     /// </summary>
     private static (double FeatureCentroidU, double CheekGradAsym) ComputeInternalFaceYawFeatures(
         byte[] grayPixels,
@@ -1127,20 +1375,23 @@ public sealed class HeadMonitorTracker : IDisposable
         int boxW,
         int boxH)
     {
-        int x0 = Math.Clamp(boxX + (int)(boxW * 0.10), 1, frameW - 2);
-        int x1 = Math.Clamp(boxX + (int)(boxW * 0.90), 1, frameW - 2);
-        int y0 = Math.Clamp(boxY + (int)(boxH * 0.22), 1, frameH - 2);
-        int y1 = Math.Clamp(boxY + (int)(boxH * 0.78), 1, frameH - 2);
+        int x0 = Math.Clamp(boxX + (int)(boxW * 0.08), 1, frameW - 2);
+        int x1 = Math.Clamp(boxX + (int)(boxW * 0.92), 1, frameW - 2);
+        int y0 = Math.Clamp(boxY + (int)(boxH * 0.20), 1, frameH - 2);
+        int y1 = Math.Clamp(boxY + (int)(boxH * 0.80), 1, frameH - 2);
 
-        if (x1 <= x0 + 4 || y1 <= y0 + 4)
+        if (x1 <= x0 + 3 || y1 <= y0 + 3)
             return (0.50, 0.0);
+
+        // Quando o usuário está mais distante da câmera (rosto menor), analisa pixel a pixel (step = 1) para máxima precisão!
+        int step = boxW < 110 ? 1 : 2;
 
         long lumSum = 0;
         int count = 0;
-        for (int y = y0; y <= y1; y += 2)
+        for (int y = y0; y <= y1; y += step)
         {
             int rowOffset = y * frameW;
-            for (int x = x0; x <= x1; x += 2)
+            for (int x = x0; x <= x1; x += step)
             {
                 lumSum += grayPixels[rowOffset + x];
                 count++;
@@ -1154,21 +1405,21 @@ public sealed class HeadMonitorTracker : IDisposable
         double rightHalfGrad = 0.0;
         int midX = boxX + (boxW / 2);
 
-        for (int y = y0; y <= y1; y += 2)
+        for (int y = y0; y <= y1; y += step)
         {
             int rowOffset = y * frameW;
             int prevRow = (y - 1) * frameW;
             int nextRow = (y + 1) * frameW;
 
-            for (int x = x0; x <= x1; x += 2)
+            for (int x = x0; x <= x1; x += step)
             {
                 int idx = rowOffset + x;
                 int gx = Math.Abs(grayPixels[idx + 1] - grayPixels[idx - 1]);
                 int gy = Math.Abs(grayPixels[nextRow + x] - grayPixels[prevRow + x]);
-                double grad = gx + 0.5 * gy;
+                double grad = gx + 0.55 * gy;
                 double darkSalience = Math.Max(0.0, meanLum - grayPixels[idx]);
 
-                double weight = grad + 0.85 * darkSalience;
+                double weight = grad + 0.95 * darkSalience;
                 double u = (double)(x - boxX) / boxW;
 
                 weightedUSum += u * weight;
@@ -1186,16 +1437,20 @@ public sealed class HeadMonitorTracker : IDisposable
         return (centroidU, asym);
     }
 
-    private void WarpCursorToMonitorCenter(bool secondaryMonitor)
+    public void ForceTestWarp(bool secondaryMonitor)
+    {
+        WarpCursorToMonitorCenter(secondaryMonitor, bypassMouseCheck: true);
+    }
+
+    private void WarpCursorToMonitorCenter(bool secondaryMonitor, bool bypassMouseCheck = false)
     {
         try
         {
-            // Nunca interrompe um clique/arraste ativo do mouse
-            if (Control.MouseButtons != MouseButtons.None)
+            if (!bypassMouseCheck && Control.MouseButtons != MouseButtons.None)
                 return;
 
             long now = Environment.TickCount64;
-            if (now - _lastWarpTick < 180)
+            if (!bypassMouseCheck && now - _lastWarpTick < 150)
                 return;
 
             Screen[] screens = Screen.AllScreens;
@@ -1205,22 +1460,18 @@ public sealed class HeadMonitorTracker : IDisposable
             Screen? targetScreen;
             if (secondaryMonitor)
             {
-                // Seleciona o segundo monitor (!Primary)
                 targetScreen = screens.FirstOrDefault(s => !s.Primary) ?? screens[^1];
             }
             else
             {
-                // Seleciona o monitor principal (Primary)
                 targetScreen = Screen.PrimaryScreen ?? screens.FirstOrDefault(s => s.Primary) ?? screens[0];
             }
 
             Rectangle b = targetScreen.Bounds;
             Point center = new(b.Left + (b.Width / 2), b.Top + (b.Height / 2));
 
-            // Na transição para o 2º monitor (rosto p/ direita), sempre centraliza no 2º monitor.
-            // Na volta para o 1º monitor (rosto reto), centraliza no 1º monitor se o cursor estava no 2º monitor.
             Screen currentScreen = Screen.FromPoint(Cursor.Position);
-            if (secondaryMonitor || !string.Equals(currentScreen.DeviceName, targetScreen.DeviceName, StringComparison.OrdinalIgnoreCase))
+            if (bypassMouseCheck || secondaryMonitor || !string.Equals(currentScreen.DeviceName, targetScreen.DeviceName, StringComparison.OrdinalIgnoreCase))
             {
                 Cursor.Position = center;
                 WrapEngine?.NotifyExternalWarp(center);
@@ -1237,6 +1488,692 @@ public sealed class HeadMonitorTracker : IDisposable
         _ = StopAsync();
     }
 }
+
+/// <summary>
+/// Tela dedicada de Teste ao Vivo e Configuração do Head Motion Monitor:
+/// Exibe o visor da câmera espelhado com marcação do rosto/nariz, medidor visual do sinal de giro (Yaw),
+/// ganho automático de longa distância e sliders em tempo real de sensibilidade e alcance.
+/// </summary>
+[System.Runtime.Versioning.SupportedOSPlatform("windows10.0.19041.0")]
+public sealed class HeadTrackerConfigWindow : System.Windows.Window
+{
+    private readonly HeadMonitorTracker _tracker;
+    private readonly CursorLoopSettings _settings;
+    private readonly Func<Task> _onToggleEnabledChanged;
+
+    private readonly System.Windows.Controls.Image _cameraImage;
+    private readonly System.Windows.Controls.Canvas _overlayCanvas;
+    private readonly System.Windows.Controls.TextBlock _stateBadgeText;
+    private readonly System.Windows.Controls.Border _stateBadgeBorder;
+    private readonly System.Windows.Controls.TextBlock _telemetryDetailText;
+    private readonly System.Windows.Controls.TextBlock _distanceBadgeText;
+
+    private readonly System.Windows.Controls.Border _gaugeFillBar;
+    private readonly System.Windows.Controls.Border _gaugeThresholdMarker;
+    private readonly System.Windows.Controls.Grid _gaugeTrackGrid;
+
+    private readonly System.Windows.Controls.Slider _sensitivitySlider;
+    private readonly System.Windows.Controls.TextBlock _sensitivityValueText;
+    private readonly System.Windows.Controls.Slider _distanceBoostSlider;
+    private readonly System.Windows.Controls.TextBlock _distanceBoostValueText;
+    private readonly System.Windows.Controls.Slider _thresholdSlider;
+    private readonly System.Windows.Controls.TextBlock _thresholdValueText;
+    private readonly System.Windows.Controls.Slider _smoothingSlider;
+    private readonly System.Windows.Controls.TextBlock _smoothingValueText;
+
+    private readonly System.Windows.Controls.CheckBox _enableTrackerCheck;
+    private readonly System.Windows.Controls.CheckBox _returnPrimaryCheck;
+    private readonly System.Windows.Controls.CheckBox _hdLongDistanceCheck;
+    private readonly System.Windows.Controls.CheckBox _pauseWarpCheck;
+
+    private System.Windows.Media.Imaging.WriteableBitmap? _writeableBmp;
+    private bool _suppressEvents;
+    private bool _startedTempPreview;
+
+    public HeadTrackerConfigWindow(
+        HeadMonitorTracker tracker,
+        CursorLoopSettings settings,
+        Func<Task> onToggleEnabledChanged)
+    {
+        _tracker = tracker;
+        _settings = settings;
+        _onToggleEnabledChanged = onToggleEnabledChanged;
+
+        Title = "🎯 Teste e Configuração — Head Motion Monitor (Sensibilidade e Longa Distância)";
+        Width = 780;
+        Height = 650;
+        MinWidth = 720;
+        MinHeight = 600;
+        WindowStartupLocation = System.Windows.WindowStartupLocation.CenterScreen;
+        Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(11, 11, 14));
+        Foreground = System.Windows.Media.Brushes.White;
+        Topmost = true;
+
+        var rootScroll = new System.Windows.Controls.ScrollViewer
+        {
+            VerticalScrollBarVisibility = System.Windows.Controls.ScrollBarVisibility.Auto,
+            Padding = new System.Windows.Thickness(18)
+        };
+
+        var mainStack = new System.Windows.Controls.StackPanel();
+
+        // 1. Cabeçalho
+        var titleBlock = new System.Windows.Controls.TextBlock
+        {
+            Text = "🎯 Teste ao Vivo e Configuração — Mouse p/ 2º Monitor com o Rosto",
+            FontSize = 18,
+            FontWeight = System.Windows.FontWeights.Bold,
+            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(244, 244, 245)),
+            Margin = new System.Windows.Thickness(0, 0, 0, 4)
+        };
+        var subBlock = new System.Windows.Controls.TextBlock
+        {
+            Text = "Vire levemente o rosto para a direita e acompanhe a barra verde ultrapassar a linha de disparo. Ajuste a sensibilidade e o alcance para trabalhar mais distante da câmera.",
+            FontSize = 12.5,
+            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(161, 161, 170)),
+            TextWrapping = System.Windows.TextWrapping.Wrap,
+            Margin = new System.Windows.Thickness(0, 0, 0, 14)
+        };
+        mainStack.Children.Add(titleBlock);
+        mainStack.Children.Add(subBlock);
+
+        // 2. Painel Superior: Visor da Câmera (Esquerda) + Medidor e Botões de Teste (Direita)
+        var topGrid = new System.Windows.Controls.Grid
+        {
+            Margin = new System.Windows.Thickness(0, 0, 0, 14)
+        };
+        topGrid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new System.Windows.GridLength(320) });
+        topGrid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new System.Windows.GridLength(14) });
+        topGrid.ColumnDefinitions.Add(new System.Windows.Controls.ColumnDefinition { Width = new System.Windows.GridLength(1, System.Windows.GridUnitType.Star) });
+
+        // Coluna 0: Visor Espelhado da Câmera
+        var camCard = new System.Windows.Controls.Border
+        {
+            Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(18, 18, 22)),
+            BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(39, 39, 42)),
+            BorderThickness = new System.Windows.Thickness(1),
+            CornerRadius = new System.Windows.CornerRadius(10),
+            Padding = new System.Windows.Thickness(8)
+        };
+
+        var camStack = new System.Windows.Controls.StackPanel();
+        var camViewportBorder = new System.Windows.Controls.Border
+        {
+            Width = 300,
+            Height = 210,
+            Background = System.Windows.Media.Brushes.Black,
+            CornerRadius = new System.Windows.CornerRadius(6),
+            ClipToBounds = true
+        };
+
+        var camLayerGrid = new System.Windows.Controls.Grid
+        {
+            Width = 300,
+            Height = 210
+        };
+
+        _cameraImage = new System.Windows.Controls.Image
+        {
+            Width = 300,
+            Height = 210,
+            Stretch = System.Windows.Media.Stretch.Fill,
+            RenderTransformOrigin = new System.Windows.Point(0.5, 0.5),
+            RenderTransform = new System.Windows.Media.ScaleTransform(-1, 1) // Espelhado natural p/ o usuário
+        };
+
+        _overlayCanvas = new System.Windows.Controls.Canvas
+        {
+            Width = 300,
+            Height = 210,
+            ClipToBounds = true
+        };
+
+        camLayerGrid.Children.Add(_cameraImage);
+        camLayerGrid.Children.Add(_overlayCanvas);
+        camViewportBorder.Child = camLayerGrid;
+
+        _distanceBadgeText = new System.Windows.Controls.TextBlock
+        {
+            Text = "📏 Alcance: Aguardando câmera...",
+            FontSize = 11.5,
+            FontWeight = System.Windows.FontWeights.SemiBold,
+            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(56, 189, 248)),
+            Margin = new System.Windows.Thickness(2, 6, 2, 0),
+            TextTrimming = System.Windows.TextTrimming.CharacterEllipsis
+        };
+
+        camStack.Children.Add(camViewportBorder);
+        camStack.Children.Add(_distanceBadgeText);
+        camCard.Child = camStack;
+        System.Windows.Controls.Grid.SetColumn(camCard, 0);
+        topGrid.Children.Add(camCard);
+
+        // Coluna 2: Medidor de Giro em Tempo Real + Ações Rápidas
+        var meterCard = new System.Windows.Controls.Border
+        {
+            Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(18, 18, 22)),
+            BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(39, 39, 42)),
+            BorderThickness = new System.Windows.Thickness(1),
+            CornerRadius = new System.Windows.CornerRadius(10),
+            Padding = new System.Windows.Thickness(14)
+        };
+
+        var meterStack = new System.Windows.Controls.StackPanel();
+
+        _stateBadgeBorder = new System.Windows.Controls.Border
+        {
+            Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(30, 41, 59)),
+            CornerRadius = new System.Windows.CornerRadius(8),
+            Padding = new System.Windows.Thickness(12, 8, 12, 8),
+            Margin = new System.Windows.Thickness(0, 0, 0, 10)
+        };
+        _stateBadgeText = new System.Windows.Controls.TextBlock
+        {
+            Text = "🟢 MONITOR 1 (OLHANDO RETO)",
+            FontSize = 14,
+            FontWeight = System.Windows.FontWeights.Bold,
+            Foreground = System.Windows.Media.Brushes.White
+        };
+        _stateBadgeBorder.Child = _stateBadgeText;
+        meterStack.Children.Add(_stateBadgeBorder);
+
+        var gaugeTitle = new System.Windows.Controls.TextBlock
+        {
+            Text = "Medidor de Giro para a Direita (Barra Verde = Sinal Atual | Linha Amarela = Disparo p/ 2º Monitor):",
+            FontSize = 11.5,
+            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(212, 212, 216)),
+            Margin = new System.Windows.Thickness(0, 0, 0, 6)
+        };
+        meterStack.Children.Add(gaugeTitle);
+
+        _gaugeTrackGrid = new System.Windows.Controls.Grid
+        {
+            Height = 26,
+            Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(9, 9, 11)),
+            Margin = new System.Windows.Thickness(0, 0, 0, 6),
+            ClipToBounds = true
+        };
+
+        _gaugeFillBar = new System.Windows.Controls.Border
+        {
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Left,
+            Width = 0,
+            Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(34, 197, 94)),
+            CornerRadius = new System.Windows.CornerRadius(4)
+        };
+
+        _gaugeThresholdMarker = new System.Windows.Controls.Border
+        {
+            HorizontalAlignment = System.Windows.HorizontalAlignment.Left,
+            Width = 3,
+            Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(250, 204, 21)),
+            Margin = new System.Windows.Thickness(100, 0, 0, 0)
+        };
+
+        _gaugeTrackGrid.Children.Add(_gaugeFillBar);
+        _gaugeTrackGrid.Children.Add(_gaugeThresholdMarker);
+        meterStack.Children.Add(_gaugeTrackGrid);
+
+        _telemetryDetailText = new System.Windows.Controls.TextBlock
+        {
+            Text = "Sinal: 0.000 | Limiar de Disparo: 0.080 | Sensibilidade: 2.4x",
+            FontSize = 11.5,
+            FontWeight = System.Windows.FontWeights.Medium,
+            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(161, 161, 170)),
+            Margin = new System.Windows.Thickness(0, 0, 0, 12)
+        };
+        meterStack.Children.Add(_telemetryDetailText);
+
+        // Botões de ação na tela de teste
+        var btnRow1 = new System.Windows.Controls.WrapPanel { Margin = new System.Windows.Thickness(0, 0, 0, 6) };
+        var recalibBtn = CreateActionButton("🎯 Recalibrar Centro Agora (Olhe p/ 1º Monitor)", true);
+        recalibBtn.Click += (_, _) =>
+        {
+            _tracker.ResetCalibration();
+            _telemetryDetailText.Text = "Recalibrando posição neutra... olhe para o 1º monitor.";
+        };
+
+        var presetBtn = CreateActionButton("⚡ Preset: Ultra Sensível + Longa Distância", false);
+        presetBtn.Click += (_, _) => ApplyUltraSensitiveLongRangePreset();
+
+        btnRow1.Children.Add(recalibBtn);
+        btnRow1.Children.Add(presetBtn);
+        meterStack.Children.Add(btnRow1);
+
+        var btnRow2 = new System.Windows.Controls.WrapPanel();
+        var testMon2Btn = CreateActionButton("↗️ Testar Centro do 2º Monitor", false);
+        testMon2Btn.Click += (_, _) => _tracker.ForceTestWarp(secondaryMonitor: true);
+
+        var testMon1Btn = CreateActionButton("↙️ Testar Centro do 1º Monitor", false);
+        testMon1Btn.Click += (_, _) => _tracker.ForceTestWarp(secondaryMonitor: false);
+
+        btnRow2.Children.Add(testMon2Btn);
+        btnRow2.Children.Add(testMon1Btn);
+        meterStack.Children.Add(btnRow2);
+
+        meterCard.Child = meterStack;
+        System.Windows.Controls.Grid.SetColumn(meterCard, 2);
+        topGrid.Children.Add(meterCard);
+
+        mainStack.Children.Add(topGrid);
+
+        // 3. Painel de Sliders de Sensibilidade e Distância
+        var slidersCard = new System.Windows.Controls.Border
+        {
+            Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(18, 18, 22)),
+            BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(39, 39, 42)),
+            BorderThickness = new System.Windows.Thickness(1),
+            CornerRadius = new System.Windows.CornerRadius(10),
+            Padding = new System.Windows.Thickness(16),
+            Margin = new System.Windows.Thickness(0, 0, 0, 12)
+        };
+
+        var slidersStack = new System.Windows.Controls.StackPanel();
+
+        (_sensitivitySlider, _sensitivityValueText) = AddSliderRow(
+            slidersStack,
+            "1. Sensibilidade do Giro de Cabeça (Mais alto = exige menos rotação para a direita):",
+            0.5, 4.5, _settings.HeadSensitivity, "0.0x",
+            val =>
+            {
+                _settings.HeadSensitivity = Math.Round(val, 2);
+                _settings.Save();
+            });
+
+        (_distanceBoostSlider, _distanceBoostValueText) = AddSliderRow(
+            slidersStack,
+            "2. Alcance / Ganho para Trabalhar Mais Distante (Amplifica quando você se afasta da câmera):",
+            0.8, 3.5, _settings.HeadDistanceBoost, "0.0x",
+            val =>
+            {
+                _settings.HeadDistanceBoost = Math.Round(val, 2);
+                _settings.Save();
+            });
+
+        (_thresholdSlider, _thresholdValueText) = AddSliderRow(
+            slidersStack,
+            "3. Limiar de Disparo p/ 2º Monitor (Mais baixo = dispara com movimento menor):",
+            0.025, 0.220, _settings.HeadEnterThreshold, "0.000",
+            val =>
+            {
+                _settings.HeadEnterThreshold = Math.Round(val, 3);
+                _settings.HeadReturnThreshold = Math.Round(Math.Max(0.010, val * 0.42), 3);
+                _settings.Save();
+                UpdateThresholdMarkerPosition();
+            });
+
+        (_smoothingSlider, _smoothingValueText) = AddSliderRow(
+            slidersStack,
+            "4. Velocidade de Resposta / Reação Imediata (Mais alto = reação mais rápida):",
+            0.25, 0.92, _settings.HeadSmoothingAlpha, "0.00",
+            val =>
+            {
+                _settings.HeadSmoothingAlpha = Math.Round(val, 2);
+                _settings.Save();
+            });
+
+        // Checkboxes de configuração
+        _enableTrackerCheck = CreateCheckBox(
+            "☑ Ativar modo Head Motion Monitor (Mover mouse p/ centro do 2º monitor ao virar o rosto à direita)",
+            _settings.HeadTrackerEnabled);
+        _enableTrackerCheck.Checked += async (_, _) => await HandleEnableCheckChangedAsync(true);
+        _enableTrackerCheck.Unchecked += async (_, _) => await HandleEnableCheckChangedAsync(false);
+
+        _returnPrimaryCheck = CreateCheckBox(
+            "☑ Retornar automaticamente o mouse p/ o centro do 1º monitor quando voltar a olhar reto",
+            _settings.HeadReturnToPrimary);
+        _returnPrimaryCheck.Checked += (_, _) => { if (!_suppressEvents) { _settings.HeadReturnToPrimary = true; _settings.Save(); } };
+        _returnPrimaryCheck.Unchecked += (_, _) => { if (!_suppressEvents) { _settings.HeadReturnToPrimary = false; _settings.Save(); } };
+
+        _hdLongDistanceCheck = CreateCheckBox(
+            "☑ Modo Longa Distância HD (Captura em maior definição + rastreio de rosto pequeno/afastado)",
+            _settings.HeadLongDistanceHdMode);
+        _hdLongDistanceCheck.Checked += async (_, _) => await HandleHdModeChangedAsync(true);
+        _hdLongDistanceCheck.Unchecked += async (_, _) => await HandleHdModeChangedAsync(false);
+
+        _pauseWarpCheck = CreateCheckBox(
+            "⏸️ Pausar o movimento do mouse apenas enquanto testo os gráficos nesta janela",
+            false);
+        _pauseWarpCheck.Checked += (_, _) => _tracker.PauseMouseWarpForTest = true;
+        _pauseWarpCheck.Unchecked += (_, _) => _tracker.PauseMouseWarpForTest = false;
+
+        slidersStack.Children.Add(_enableTrackerCheck);
+        slidersStack.Children.Add(_returnPrimaryCheck);
+        slidersStack.Children.Add(_hdLongDistanceCheck);
+        slidersStack.Children.Add(_pauseWarpCheck);
+
+        slidersCard.Child = slidersStack;
+        mainStack.Children.Add(slidersCard);
+
+        rootScroll.Content = mainStack;
+        Content = rootScroll;
+
+        Loaded += async (_, _) =>
+        {
+            UpdateThresholdMarkerPosition();
+            _tracker.IncludePreviewFrame = true;
+            _tracker.OnTelemetryFrame += HandleTelemetryFrame;
+
+            if (!_tracker.IsRunning)
+            {
+                _startedTempPreview = true;
+                await _tracker.StartAsync();
+            }
+        };
+
+        Closed += async (_, _) =>
+        {
+            _tracker.IncludePreviewFrame = false;
+            _tracker.PauseMouseWarpForTest = false;
+            _tracker.OnTelemetryFrame -= HandleTelemetryFrame;
+
+            if (_startedTempPreview && !_settings.HeadTrackerEnabled)
+            {
+                await _tracker.StopAsync();
+            }
+        };
+    }
+
+    private async Task HandleEnableCheckChangedAsync(bool enabled)
+    {
+        if (_suppressEvents)
+            return;
+
+        if (_settings.HeadTrackerEnabled != enabled)
+        {
+            _startedTempPreview = false;
+            await _onToggleEnabledChanged();
+            if (!_tracker.IsRunning)
+            {
+                _startedTempPreview = true;
+                await _tracker.StartAsync();
+            }
+        }
+    }
+
+    private async Task HandleHdModeChangedAsync(bool hdEnabled)
+    {
+        if (_suppressEvents)
+            return;
+
+        _settings.HeadLongDistanceHdMode = hdEnabled;
+        _settings.Save();
+        if (_tracker.IsRunning)
+        {
+            await _tracker.StopAsync();
+            await _tracker.StartAsync();
+        }
+    }
+
+    private void ApplyUltraSensitiveLongRangePreset()
+    {
+        _suppressEvents = true;
+        try
+        {
+            _settings.HeadSensitivity = 3.1;
+            _settings.HeadDistanceBoost = 2.5;
+            _settings.HeadEnterThreshold = 0.065;
+            _settings.HeadReturnThreshold = 0.026;
+            _settings.HeadSmoothingAlpha = 0.72;
+            _settings.HeadConfirmFrames = 1;
+            _settings.HeadLongDistanceHdMode = true;
+            _settings.Save();
+
+            _sensitivitySlider.Value = _settings.HeadSensitivity;
+            _sensitivityValueText.Text = $"{_settings.HeadSensitivity:0.0}x";
+
+            _distanceBoostSlider.Value = _settings.HeadDistanceBoost;
+            _distanceBoostValueText.Text = $"{_settings.HeadDistanceBoost:0.0}x";
+
+            _thresholdSlider.Value = _settings.HeadEnterThreshold;
+            _thresholdValueText.Text = $"{_settings.HeadEnterThreshold:0.000}";
+
+            _smoothingSlider.Value = _settings.HeadSmoothingAlpha;
+            _smoothingValueText.Text = $"{_settings.HeadSmoothingAlpha:0.00}";
+
+            _hdLongDistanceCheck.IsChecked = true;
+            UpdateThresholdMarkerPosition();
+            _tracker.ResetCalibration();
+        }
+        finally
+        {
+            _suppressEvents = false;
+        }
+    }
+
+    private void UpdateThresholdMarkerPosition()
+    {
+        double trackW = _gaugeTrackGrid.ActualWidth > 20 ? _gaugeTrackGrid.ActualWidth : 380;
+        double maxScale = 0.26;
+        double ratio = Math.Clamp(_settings.HeadEnterThreshold / maxScale, 0.05, 0.95);
+        _gaugeThresholdMarker.Margin = new System.Windows.Thickness(ratio * trackW, 0, 0, 0);
+    }
+
+    private void HandleTelemetryFrame(HeadTrackerTelemetry t)
+    {
+        Dispatcher.BeginInvoke(() =>
+        {
+            try
+            {
+                if (t.GrayPixels != null && t.FrameWidth > 0 && t.FrameHeight > 0)
+                {
+                    if (_writeableBmp == null || _writeableBmp.PixelWidth != t.FrameWidth || _writeableBmp.PixelHeight != t.FrameHeight)
+                    {
+                        _writeableBmp = new System.Windows.Media.Imaging.WriteableBitmap(
+                            t.FrameWidth,
+                            t.FrameHeight,
+                            96,
+                            96,
+                            System.Windows.Media.PixelFormats.Gray8,
+                            null);
+                        _cameraImage.Source = _writeableBmp;
+                    }
+
+                    _writeableBmp.WritePixels(
+                        new System.Windows.Int32Rect(0, 0, t.FrameWidth, t.FrameHeight),
+                        t.GrayPixels,
+                        t.FrameWidth,
+                        0);
+
+                    DrawCameraOverlay(t);
+                }
+
+                if (!t.FaceDetected)
+                {
+                    _stateBadgeBorder.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(120, 53, 15));
+                    _stateBadgeText.Text = "⚠️ AGUARDANDO ROSTO NA CÂMERA...";
+                    _distanceBadgeText.Text = "📏 Enquadre seu rosto na webcam para calibrar";
+                }
+                else if (!t.IsCalibrated)
+                {
+                    _stateBadgeBorder.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(30, 58, 138));
+                    _stateBadgeText.Text = "⏳ CALIBRANDO CENTRO (OLHE P/ 1º MONITOR)...";
+                }
+                else if (t.IsLookingRight)
+                {
+                    _stateBadgeBorder.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(21, 128, 61));
+                    _stateBadgeText.Text = "🎯 ROSTO P/ DIREITA ➔ MOUSE NO 2º MONITOR!";
+                }
+                else
+                {
+                    _stateBadgeBorder.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(30, 41, 59));
+                    _stateBadgeText.Text = "🟢 OLHANDO RETO (1º MONITOR PRINCIPAL)";
+                }
+
+                string distLabel = t.DistanceGainApplied >= 1.55
+                    ? $"Longa Distância Ativa (Boost Automático {t.DistanceGainApplied:0.0}x)"
+                    : $"Distância Normal (Boost {t.DistanceGainApplied:0.0}x)";
+                if (t.IsFallbackLongRangeRoi)
+                    distLabel += " • [Rastreio de Perfil/Longe]";
+                _distanceBadgeText.Text = $"📏 {distLabel} • Ganho Total: {t.TotalGainApplied:0.1f}x";
+
+                double trackW = _gaugeTrackGrid.ActualWidth > 20 ? _gaugeTrackGrid.ActualWidth : 380;
+                double maxScale = 0.26;
+                double fillRatio = Math.Clamp(Math.Max(0, t.SmoothedYawRight) / maxScale, 0.0, 1.0);
+                _gaugeFillBar.Width = fillRatio * trackW;
+                _gaugeFillBar.Background = t.SmoothedYawRight >= t.EnterThreshold
+                    ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(34, 197, 94))
+                    : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(56, 189, 248));
+
+                double threshRatio = Math.Clamp(t.EnterThreshold / maxScale, 0.05, 0.95);
+                _gaugeThresholdMarker.Margin = new System.Windows.Thickness(threshRatio * trackW, 0, 0, 0);
+
+                _telemetryDetailText.Text =
+                    $"Sinal Atual: {t.SmoothedYawRight:+0.000;-0.000;0.000}  |  Limiar Disparo: +{t.EnterThreshold:0.000}  |  Retorno: +{t.ReturnThreshold:0.000}";
+            }
+            catch { }
+        });
+    }
+
+    private void DrawCameraOverlay(HeadTrackerTelemetry t)
+    {
+        _overlayCanvas.Children.Clear();
+        double cw = _overlayCanvas.Width;
+        double ch = _overlayCanvas.Height;
+
+        // Como a imagem está espelhada horizontalmente (ScaleX = -1), a coordenada X espelhada na tela é (1.0 - normX) * cw
+        double mirroredBaseX = (1.0 - t.BaselineX) * cw;
+        var baseLine = new System.Windows.Shapes.Line
+        {
+            X1 = mirroredBaseX,
+            Y1 = 0,
+            X2 = mirroredBaseX,
+            Y2 = ch,
+            Stroke = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(170, 148, 163, 184)),
+            StrokeThickness = 1.5,
+            StrokeDashArray = new System.Windows.Media.DoubleCollection { 4, 3 }
+        };
+        _overlayCanvas.Children.Add(baseLine);
+
+        if (!t.FaceDetected || t.FaceBox.Width <= 0 || t.FrameWidth <= 0 || t.FrameHeight <= 0)
+            return;
+
+        double scaleX = cw / t.FrameWidth;
+        double scaleY = ch / t.FrameHeight;
+
+        double rawLeft = t.FaceBox.X * scaleX;
+        double boxW = t.FaceBox.Width * scaleX;
+        double mirroredLeft = cw - (rawLeft + boxW);
+        double boxTop = t.FaceBox.Y * scaleY;
+        double boxH = t.FaceBox.Height * scaleY;
+
+        var boxColor = t.IsLookingRight
+            ? System.Windows.Media.Color.FromRgb(34, 197, 94)
+            : (t.IsFallbackLongRangeRoi
+                ? System.Windows.Media.Color.FromRgb(245, 158, 11)
+                : System.Windows.Media.Color.FromRgb(56, 189, 248));
+
+        var rect = new System.Windows.Shapes.Rectangle
+        {
+            Width = Math.Max(8, boxW),
+            Height = Math.Max(8, boxH),
+            Stroke = new System.Windows.Media.SolidColorBrush(boxColor),
+            StrokeThickness = 2.2,
+            RadiusX = 5,
+            RadiusY = 5
+        };
+        System.Windows.Controls.Canvas.SetLeft(rect, mirroredLeft);
+        System.Windows.Controls.Canvas.SetTop(rect, boxTop);
+        _overlayCanvas.Children.Add(rect);
+
+        // Ponto do centroide do nariz/feições espelhado
+        double noseMirroredX = mirroredLeft + (1.0 - t.FeatureCentroidU) * boxW;
+        double noseY = boxTop + (boxH * 0.52);
+        var noseDot = new System.Windows.Shapes.Ellipse
+        {
+            Width = 9,
+            Height = 9,
+            Fill = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(250, 204, 21)),
+            Stroke = System.Windows.Media.Brushes.Black,
+            StrokeThickness = 1.2
+        };
+        System.Windows.Controls.Canvas.SetLeft(noseDot, noseMirroredX - 4.5);
+        System.Windows.Controls.Canvas.SetTop(noseDot, noseY - 4.5);
+        _overlayCanvas.Children.Add(noseDot);
+    }
+
+    private (System.Windows.Controls.Slider Slider, System.Windows.Controls.TextBlock ValueLabel) AddSliderRow(
+        System.Windows.Controls.StackPanel parent,
+        string label,
+        double min,
+        double max,
+        double initial,
+        string format,
+        Action<double> onChanged)
+    {
+        var rowHeader = new System.Windows.Controls.DockPanel { Margin = new System.Windows.Thickness(0, 0, 0, 3) };
+        var valText = new System.Windows.Controls.TextBlock
+        {
+            Text = initial.ToString(format, CultureInfo.InvariantCulture),
+            FontSize = 12.5,
+            FontWeight = System.Windows.FontWeights.Bold,
+            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(56, 189, 248))
+        };
+        System.Windows.Controls.DockPanel.SetDock(valText, System.Windows.Controls.Dock.Right);
+
+        var titleText = new System.Windows.Controls.TextBlock
+        {
+            Text = label,
+            FontSize = 12,
+            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(228, 228, 231))
+        };
+        rowHeader.Children.Add(valText);
+        rowHeader.Children.Add(titleText);
+
+        var slider = new System.Windows.Controls.Slider
+        {
+            Minimum = min,
+            Maximum = max,
+            Value = Math.Clamp(initial, min, max),
+            Margin = new System.Windows.Thickness(0, 0, 0, 10),
+            Cursor = System.Windows.Input.Cursors.Hand
+        };
+        slider.ValueChanged += (_, e) =>
+        {
+            if (_suppressEvents)
+                return;
+            valText.Text = e.NewValue.ToString(format, CultureInfo.InvariantCulture);
+            onChanged(e.NewValue);
+        };
+
+        parent.Children.Add(rowHeader);
+        parent.Children.Add(slider);
+        return (slider, valText);
+    }
+
+    private static System.Windows.Controls.CheckBox CreateCheckBox(string text, bool isChecked)
+    {
+        return new System.Windows.Controls.CheckBox
+        {
+            Content = text,
+            IsChecked = isChecked,
+            Foreground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(228, 228, 231)),
+            FontSize = 12,
+            Margin = new System.Windows.Thickness(0, 4, 0, 4),
+            Cursor = System.Windows.Input.Cursors.Hand
+        };
+    }
+
+    private static System.Windows.Controls.Button CreateActionButton(string text, bool primary)
+    {
+        return new System.Windows.Controls.Button
+        {
+            Content = text,
+            Cursor = System.Windows.Input.Cursors.Hand,
+            Background = primary
+                ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(37, 99, 235))
+                : new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(39, 39, 42)),
+            Foreground = System.Windows.Media.Brushes.White,
+            BorderThickness = new System.Windows.Thickness(0),
+            FontSize = 11.5,
+            FontWeight = System.Windows.FontWeights.SemiBold,
+            Padding = new System.Windows.Thickness(10, 6, 10, 6),
+            Margin = new System.Windows.Thickness(0, 0, 6, 4)
+        };
+    }
+}
+
+
 
 
 

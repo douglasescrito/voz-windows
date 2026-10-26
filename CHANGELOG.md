@@ -4,6 +4,13 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.7] — 26/10/2026
+
+- **Tela de Teste ao Vivo e Configuração do Head Motion (🎯 Config):** Visor espelhado da webcam em tempo real com marcação do rosto e nariz, medidor visual de giro (Yaw) com marcador de limiar e botões de recalibração e teste imediato dos monitores.
+- **Maior Sensibilidade e Modo Longa Distância HD:** Sensibilidade padrão ampliada (2.4x + limiar
+
+---
+
 ## [v1.3.6] — 26/10/2026
 
 - **Novo Modo Head Motion Monitor (👀 Head ON / OFF):** Move o mouse em tempo real para o centro do segundo monitor ao virar o rosto para a direita, retornando ao centro do monitor principal quando o rosto volta a ficar reto (com auto-calibração, filtro EMA e histerese para não brigar com o mouse físico).
