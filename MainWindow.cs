@@ -350,13 +350,13 @@ public sealed class MainWindow : Window
         _outerBorder.Child = rootMorphGrid;
         Content = _outerBorder;
 
-        // 8ms (~120 FPS) Engine Timer: Head Realtime Mouse + CursorLoop (only on owner machine) + Active Target Tracker
+        // 8ms (~120 FPS) Engine Timer: CursorLoop detecta movimento físico do Touchpad + Head Realtime Espacial + Active Target Tracker
         _cursorTimer.Tick += (_, _) =>
         {
             if (CursorLoopSettings.IsCursorLoopSupported)
             {
-                _headTracker.TickRealtimeCursor();
                 _cursorEngine.Tick(_cursorSettings.Enabled, _cursorSettings.HorizontalLoop, _cursorSettings.VerticalLoop);
+                _headTracker.TickRealtimeCursor(_cursorEngine.LastTickHadPhysicalMove);
             }
             TrackActiveExternalWindow();
         };

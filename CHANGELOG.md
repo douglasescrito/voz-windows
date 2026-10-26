@@ -4,6 +4,13 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.9] — 26/10/2026
+
+- Calibracao espacial hibrida combinando Touchpad + Head Realtime (ajustar com o touch reposiciona a ancora do RT e recalibra o centro espacial do rosto automaticamente)
+- Mapeamento espacial direto 1:1 sem drift continuo, com estabilizacao de mira e ratchet automatico nas bordas da tela
+
+---
+
 ## [v1.3.8] — 26/10/2026
 
 - Modo Funcao Realtime para controlar o mouse pelo rosto (X e Y continuo em 120 Hz com zona morta central e aceleracao progressiva)
