@@ -83,6 +83,7 @@ public static class Program
 
         bool wantCursorLoop = args.Any(a => string.Equals(a, "--cursorloop", StringComparison.OrdinalIgnoreCase));
         bool wantHeadConfig = args.Any(a => string.Equals(a, "--head-config", StringComparison.OrdinalIgnoreCase));
+        bool wantSidebar = args.Any(a => string.Equals(a, "--sidebar", StringComparison.OrdinalIgnoreCase));
 
         using var showUiEvent = OpenOrCreateSharedEvent(ShowUiEventName);
         using var cursorLoopEvent = OpenOrCreateSharedEvent(CursorLoopEventName);
@@ -179,6 +180,10 @@ public static class Program
         }
 
         win.InitializeTrayOnlyStartup(openCursorLoopOnStart: wantCursorLoop);
+        if (wantSidebar)
+        {
+            win.MaximizeToSidebar(ensureListening: false);
+        }
         if (wantHeadConfig)
         {
             win.OpenHeadTrackerConfigWindow();

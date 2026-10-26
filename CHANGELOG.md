@@ -4,6 +4,12 @@ Todas as alterações relevantes do **VozWindows** são documentadas neste arqui
 
 ---
 
+## [v1.3.12] — 26/10/2026
+
+Rodape da barra lateral em WrapPanel de 2 linhas (sem cortar botoes na lateral direita) + quebra automatica do subtitulo no topo
+
+---
+
 ## [v1.3.11] — 26/10/2026
 
 Card dedicado com Sliders de Velocidade/Sensibilidade Espacial do Mouse RT (1.2x padrao + presets 0.8x/1.2x/1.8x + Trava do Touch) e modo Ouvir o Computador (WASAPI Loopback ON/OFF)

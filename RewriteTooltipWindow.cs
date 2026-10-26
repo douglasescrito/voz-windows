@@ -16,7 +16,7 @@ namespace VozWindows;
 public sealed class RewriteDeckView : Border
 {
     private const int OptionCount = 6;
-    public const double NormalSlotWidthDip = 375;
+    public const double NormalSlotWidthDip = 385;
 
     private readonly TextBlock _slotTitleText;
     private readonly TextBlock _headerStatusText;
@@ -158,7 +158,7 @@ public sealed class RewriteDeckView : Border
             FontSize = 10.5,
             FontWeight = FontWeights.SemiBold,
             Foreground = BrushSkyAccent,
-            TextTrimming = TextTrimming.CharacterEllipsis
+            TextWrapping = TextWrapping.Wrap
         };
 
         var headerBtns = new StackPanel { Orientation = Orientation.Horizontal };

@@ -172,9 +172,11 @@ public sealed class MainWindow : Window
             VerticalAlignment = VerticalAlignment.Bottom,
             MinHeight = 46
         };
+        mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Row 0: Mic button + Status Visor + Minimize button
+        mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Row 1: Wrapped Quick-Action Pills (never clips in Sidebar!)
         mainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); // Col 0: Mic button
         mainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // Col 1: Status Visor
-        mainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); // Col 2: CursorLoop + Minimize to Tray
+        mainGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto }); // Col 2: Minimize to Tray
 
         // 1. Mic Toggle Button (F8)
         _micButton = new Button
@@ -199,6 +201,7 @@ public sealed class MainWindow : Window
         _micButton.Content = _micButtonLabel;
         ApplyRoundedButtonTemplate(_micButton, 10);
         _micButton.Click += async (_, _) => await ToggleDictationAsync();
+        Grid.SetRow(_micButton, 0);
         Grid.SetColumn(_micButton, 0);
         mainGrid.Children.Add(_micButton);
 
@@ -228,7 +231,7 @@ public sealed class MainWindow : Window
         _textStack = new StackPanel
         {
             VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(0, 0, 8, 0)
+            Margin = new Thickness(0, 0, 6, 0)
         };
 
         var statusRow = new StackPanel
@@ -270,14 +273,16 @@ public sealed class MainWindow : Window
         Grid.SetColumn(_textStack, 1);
         _middleVisorGrid.Children.Add(_textStack);
 
+        Grid.SetRow(_middleVisorGrid, 0);
         Grid.SetColumn(_middleVisorGrid, 1);
         mainGrid.Children.Add(_middleVisorGrid);
 
-        // 3. Right Controls: CursorLoop Mode + Minimize to Tray
-        var actionsPanel = new StackPanel
+        // 3. Wrapped Quick-Action Controls (Row 1: automatically wraps into 2 neat rows in Sidebar without ever cutting off!)
+        var actionsPanel = new WrapPanel
         {
             Orientation = Orientation.Horizontal,
-            VerticalAlignment = VerticalAlignment.Center
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 7, 0, 0)
         };
 
         _rewriteToggleButton = CreateSmallActionButton(
@@ -338,7 +343,11 @@ public sealed class MainWindow : Window
         _minButton.Visibility = Visibility.Collapsed;
 
         var closeButton = CreateSmallActionButton("—", "Minimizar a barra lateral para o ícone da bandeja do relógio (clique no ícone da bandeja para restaurar)");
+        closeButton.Margin = new Thickness(4, 0, 0, 0);
         closeButton.Click += (_, _) => MinimizeToTray();
+        Grid.SetRow(closeButton, 0);
+        Grid.SetColumn(closeButton, 2);
+        mainGrid.Children.Add(closeButton);
 
         actionsPanel.Children.Add(_rewriteToggleButton);
         actionsPanel.Children.Add(_listenPcAudioButton);
@@ -347,9 +356,10 @@ public sealed class MainWindow : Window
         actionsPanel.Children.Add(_headConfigButton);
         actionsPanel.Children.Add(_cursorLoopButton);
         actionsPanel.Children.Add(_cursorSpeedButton);
-        actionsPanel.Children.Add(closeButton);
 
-        Grid.SetColumn(actionsPanel, 2);
+        Grid.SetRow(actionsPanel, 1);
+        Grid.SetColumn(actionsPanel, 0);
+        Grid.SetColumnSpan(actionsPanel, 3);
         mainGrid.Children.Add(actionsPanel);
 
         Grid.SetRow(mainGrid, 1);
@@ -668,13 +678,13 @@ public sealed class MainWindow : Window
             Background = new SolidColorBrush(Color.FromRgb(22, 22, 26)), // #16161A True Dark Card
             Foreground = new SolidColorBrush(Color.FromRgb(228, 228, 231)), // #E4E4E7
             BorderThickness = new Thickness(0),
-            FontSize = 11.5,
+            FontSize = 11,
             FontWeight = FontWeights.SemiBold,
-            Padding = new Thickness(9, 6, 9, 6),
-            Margin = new Thickness(4, 0, 0, 0),
+            Padding = new Thickness(8, 5, 8, 5),
+            Margin = new Thickness(0, 0, 5, 5),
             VerticalAlignment = VerticalAlignment.Center
         };
-        ApplyRoundedButtonTemplate(btn, 9);
+        ApplyRoundedButtonTemplate(btn, 8);
         return btn;
     }
 
